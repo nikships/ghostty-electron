@@ -26,7 +26,8 @@
             "<(module_root_dir)/../vendor/ghostty/zig-out/lib/ghostty-vt-static.lib",
             "libcmt.lib",
             "libucrt.lib",
-            "libvcruntime.lib"
+            "libvcruntime.lib",
+            "ntdll.lib"
           ]
         }],
         ["OS not in ['mac', 'win']", {
