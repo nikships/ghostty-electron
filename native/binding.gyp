@@ -23,10 +23,9 @@
           "sources": ["src/producer_stub.c"],
           "libraries": [
             "<(module_root_dir)/../vendor/ghostty/zig-out/lib/ghostty-vt.lib",
-            "ucrt.lib",
-            "msvcrt.lib",
-            "vcruntime.lib",
-            "legacy_stdio_definitions.lib"
+            "libcmt.lib",
+            "libucrt.lib",
+            "libvcruntime.lib"
           ]
         }],
         ["OS not in ['mac', 'win']", {

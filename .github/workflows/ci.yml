@@ -108,6 +108,13 @@ jobs:
       - name: Build native addon (VT core + stub platform layer)
         run: npm run build:native
 
+      - name: Inspect addon DLL dependencies (diagnostics)
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          & $dumpbin /DEPENDENTS native/build/Release/ghostty_producer.node
+
       - name: Generate payload
         run: npm run payload
 
