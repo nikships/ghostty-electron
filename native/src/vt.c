@@ -562,6 +562,134 @@ static napi_value GetRecentText(napi_env env, napi_callback_info info) {
   return result;
 }
 
+
+/** setCursorHidden(session, hidden) — host-driven cursor blink phase. */
+static napi_value SetCursorHidden(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 2, "setCursorHidden(session, hidden)");
+
+  Session *s = gxb_get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  bool hidden = false;
+  NAPI_CALL(env, napi_get_value_bool(env, argv[1], &hidden));
+  if (hidden != s->cursor_hidden) {
+    s->cursor_hidden = hidden;
+    s->mod_seq++;
+    if (s->prev_cursor_valid && s->prev_cursor_y < s->rows)
+      s->row_modified[s->prev_cursor_y] = s->mod_seq;
+    s->needs_present = true;
+  }
+  return NULL;
+}
+
+/** selectWord(session, x, y) → string | null — double-click word selection
+ *  at viewport cell (x, y), installed as the terminal selection. */
+static napi_value SelectWord(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 3, "selectWord(session, x, y)");
+
+  Session *s = gxb_get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  uint32_t x, y;
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[1], &x));
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[2], &y));
+
+  napi_value null_val;
+  NAPI_CALL(env, napi_get_null(env, &null_val));
+
+  GhosttyPoint pt = {
+      .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+      .value = {.coordinate = {.x = (uint16_t)x, .y = (uint16_t)y}},
+  };
+  GhosttyTerminalSelectWordOptions opts =
+      GHOSTTY_INIT_SIZED(GhosttyTerminalSelectWordOptions);
+  if (ghostty_terminal_grid_ref(s->terminal, pt, &opts.ref) != GHOSTTY_SUCCESS)
+    return null_val;
+
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  if (ghostty_terminal_select_word(s->terminal, &opts, &sel) !=
+      GHOSTTY_SUCCESS)
+    return null_val;
+  if (ghostty_terminal_set(s->terminal, GHOSTTY_TERMINAL_OPT_SELECTION,
+                           &sel) != GHOSTTY_SUCCESS)
+    return null_val;
+  dirty_all_rows(s);
+
+  // Return the selected text so the caller can use it directly.
+  GhosttyFormatterTerminalOptions fopts =
+      GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
+  fopts.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  fopts.trim = true;
+  fopts.selection = &sel;
+  GhosttyFormatter formatter;
+  if (ghostty_formatter_terminal_new(NULL, &formatter, s->terminal, fopts) !=
+      GHOSTTY_SUCCESS)
+    return null_val;
+  uint8_t *buf = NULL;
+  size_t len = 0;
+  napi_value result = null_val;
+  if (ghostty_formatter_format_alloc(formatter, NULL, &buf, &len) ==
+          GHOSTTY_SUCCESS && buf) {
+    napi_create_string_utf8(env, (const char *)buf, len, &result);
+    ghostty_free(NULL, buf, len);
+  }
+  ghostty_formatter_free(formatter);
+  return result;
+}
+
+/** scrollToRow(session, row) — absolute screen-space row (scrollbar space). */
+static napi_value ScrollToRow(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 2, "scrollToRow(session, row)");
+
+  Session *s = gxb_get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  uint32_t row;
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[1], &row));
+
+  GhosttyTerminalScrollViewport behavior = {
+      .tag = GHOSTTY_SCROLL_VIEWPORT_ROW,
+      .value = {.row = row},
+  };
+  ghostty_terminal_scroll_viewport(s->terminal, behavior);
+  return NULL;
+}
+
+/** getScrollbar(session) → { total, offset, len } — screen-space geometry. */
+static napi_value GetScrollbar(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  Session *s = gxb_get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  GhosttyTerminalScrollbar bar;
+  THROW_IF(env,
+           ghostty_terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                                &bar) != GHOSTTY_SUCCESS,
+           "scrollbar query failed");
+
+  napi_value result, v;
+  NAPI_CALL(env, napi_create_object(env, &result));
+  NAPI_CALL(env, napi_create_double(env, (double)bar.total, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "total", v));
+  NAPI_CALL(env, napi_create_double(env, (double)bar.offset, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "offset", v));
+  NAPI_CALL(env, napi_create_double(env, (double)bar.len, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "len", v));
+  return result;
+}
+
 /* ── encodeKey ────────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -713,6 +841,10 @@ NAPI_MODULE_INIT() {
       {"clearSelection", NULL, ClearSelection, NULL, NULL, NULL, napi_default, NULL},
       {"getSelectionText", NULL, GetSelectionText, NULL, NULL, NULL, napi_default, NULL},
       {"getRecentText", NULL, GetRecentText, NULL, NULL, NULL, napi_default, NULL},
+      {"setCursorHidden", NULL, SetCursorHidden, NULL, NULL, NULL, napi_default, NULL},
+      {"selectWord", NULL, SelectWord, NULL, NULL, NULL, napi_default, NULL},
+      {"scrollToRow", NULL, ScrollToRow, NULL, NULL, NULL, napi_default, NULL},
+      {"getScrollbar", NULL, GetScrollbar, NULL, NULL, NULL, napi_default, NULL},
   };
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
   gxb_platform_register(env, exports);  // render/readPixels on macOS

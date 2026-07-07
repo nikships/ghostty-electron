@@ -13,7 +13,7 @@ if (process.platform !== 'darwin') {
   console.error('The demo needs the native IOSurface producer (macOS-only for now).');
   process.exit(1);
 }
-const { app, BrowserWindow, clipboard, ipcMain, screen, sharedTexture } = require('electron');
+const { app, BrowserWindow, clipboard, ipcMain, screen, shell, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const pty = require('node-pty');
@@ -203,6 +203,89 @@ app.whenReady().then(async () => {
     } catch {}
   });
 
+  // Cursor blink: host-driven phase toggle, paused while output/typing is
+  // active (like every native terminal).
+  let lastActivity = performance.now();
+  ptyG.onData(() => { lastActivity = performance.now(); });
+  let blinkHidden = false;
+  const blinkTimer = setInterval(() => {
+    try {
+      if (performance.now() - lastActivity < 600) {
+        if (blinkHidden) { blinkHidden = false; addon.setCursorHidden(term.session, false); }
+        return;
+      }
+      blinkHidden = !blinkHidden;
+      addon.setCursorHidden(term.session, blinkHidden);
+    } catch {}
+  }, 530);
+
+  // Double-click word selection (ghostty's own word-boundary rules).
+  ipcMain.on('g-selword', (event, { x, y }) => {
+    try {
+      const text = addon.selectWord(term.session,
+        Math.max(0, Math.min(COLS - 1, x)), Math.max(0, Math.min(ROWS - 1, y)));
+      hasSelection = !!text;
+    } catch {}
+  });
+
+  // Cmd+click opens the URL under the pointer.
+  const URL_RE = /https?:\/\/[^\s'"«»‹›]+/g;
+  ipcMain.on('g-link', (event, { x, y }) => {
+    try {
+      const line = addon.getText(term.session)[Math.max(0, Math.min(ROWS - 1, y))] || '';
+      for (const m of line.matchAll(URL_RE)) {
+        if (x >= m.index && x < m.index + m[0].length) {
+          shell.openExternal(m[0].replace(/[.,;:)\]]+$/, ''));
+          return;
+        }
+      }
+    } catch {}
+  });
+
+  // IME: composed text arrives whole from the renderer's composition events.
+  ipcMain.on('g-ime', (event, text) => {
+    clearSelection();
+    if (typeof text === 'string' && text) ptyG.write(text);
+  });
+
+  // Cmd+F search over screen + scrollback: scroll to the hit, highlight it
+  // via the selection machinery.
+  let search = { query: '', matches: [], idx: -1 };
+  ipcMain.on('g-search', (event, { query, dir }) => {
+    try {
+      if (query !== search.query) {
+        const bar = addon.getScrollbar(term.session);
+        const rows = (addon.getRecentText(term.session, bar.total) || '').split('\n');
+        const base = bar.total - rows.length;
+        const matches = [];
+        rows.forEach((line, i) => {
+          let col = line.indexOf(query);
+          while (query && col !== -1) {
+            matches.push({ row: base + i, col });
+            col = line.indexOf(query, col + 1);
+          }
+        });
+        search = { query, matches, idx: -1 };
+      }
+      if (!search.matches.length) {
+        event.sender.send('search-result', { count: 0, idx: 0 });
+        return;
+      }
+      search.idx = (search.idx + (dir || 1) + search.matches.length) % search.matches.length;
+      const m = search.matches[search.idx];
+      addon.scrollToRow(term.session, Math.max(0, m.row - Math.floor(ROWS / 2)));
+      const offset = addon.getScrollbar(term.session).offset;
+      const vy = m.row - offset;
+      if (vy >= 0 && vy < ROWS) {
+        addon.setSelection(term.session, m.col, vy,
+          Math.min(COLS - 1, m.col + search.query.length - 1), vy);
+        hasSelection = true;
+      }
+      event.sender.send('search-result', { count: search.matches.length, idx: search.idx + 1 });
+    } catch {}
+  });
+  ipcMain.on('g-search-close', () => { search = { query: '', matches: [], idx: -1 }; clearSelection(); });
+
   let scrollRemainder = 0;
   ipcMain.on('g-wheel', (event, { deltaY }) => {
     scrollRemainder += deltaY / (term.cellHeight / scale);
@@ -244,6 +327,7 @@ app.whenReady().then(async () => {
   app.on('before-quit', () => {
     clearInterval(presentTimer);
     clearInterval(statsTimer);
+    clearInterval(blinkTimer);
     try { ptyG.kill(); } catch {}
     try { ptyX.kill(); } catch {}
   });

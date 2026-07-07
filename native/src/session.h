@@ -68,6 +68,9 @@ typedef struct {
   bool prev_cursor_valid;
   uint16_t prev_cursor_x, prev_cursor_y;
 
+  // Host-driven blink phase: when set, render() skips the cursor.
+  bool cursor_hidden;
+
 #ifdef __APPLE__
   IOSurfaceRef surfaces[2];
   int surface_index;

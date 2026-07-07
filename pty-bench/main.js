@@ -51,6 +51,7 @@ const SIZE_MB = flagNum('--mb', 1024);
 const INTERRUPT_MS = flagNum('--interrupt-ms', 4000);
 const SAMPLES = flagNum('--samples', 8);
 const LATENCY = process.argv.includes('--latency');
+const SOAK_MIN = flagNum('--soak-min', 0);
 
 // Sentinels: built with $((…)) so the *typed command* echoed to the screen
 // never matches the exact output line we search for.
@@ -108,9 +109,11 @@ function ensurePayload() {
 
 /* ── metrics sampler ─────────────────────────────────────────────────── */
 
-function startMetricsSampler() {
+function startMetricsSampler({ series = false } = {}) {
   const cpuSeconds = {};
   let peakMemMB = 0;
+  const memSeries = [];
+  const t0 = now();
   const baseline = app.getAppMetrics() // also resets percentCPUUsage baseline
     .reduce((sum, p) => sum + (p.memory.workingSetSize || 0) / 1024, 0);
   let last = now();
@@ -124,7 +127,8 @@ function startMetricsSampler() {
       mem += (p.memory.workingSetSize || 0) / 1024; // KB → MB
     }
     peakMemMB = Math.max(peakMemMB, mem);
-  }, 250);
+    if (series) memSeries.push({ tMin: (t - t0) / 60000, memMB: mem - baseline });
+  }, series ? 2000 : 250);
   return {
     stop() {
       clearInterval(timer);
@@ -135,10 +139,24 @@ function startMetricsSampler() {
         cpuSeconds: rounded,
         cpuTotal: +total.toFixed(2),
         // Growth over the app's pre-run footprint, not absolute WSS.
-        peakMemMB: Math.round(Math.max(0, peakMemMB - baseline))
+        peakMemMB: Math.round(Math.max(0, peakMemMB - baseline)),
+        memSeries
       };
     }
   };
+}
+
+/** Least-squares slope (MB/min) over the last two-thirds of a memory series —
+ *  the first third is warm-up (scrollback filling to its cap). */
+function memSlope(series) {
+  const tail = series.slice(Math.floor(series.length / 3));
+  if (tail.length < 4) return 0;
+  const n = tail.length;
+  const mx = tail.reduce((a, s) => a + s.tMin, 0) / n;
+  const my = tail.reduce((a, s) => a + s.memMB, 0) / n;
+  let num = 0, den = 0;
+  for (const s of tail) { num += (s.tMin - mx) * (s.memMB - my); den += (s.tMin - mx) ** 2; }
+  return den ? num / den : 0;
 }
 
 /* ── pipe ceiling control ────────────────────────────────────────────── */
@@ -158,7 +176,7 @@ function pipeCeiling(file) {
 
 /* ── ghostty runner ──────────────────────────────────────────────────── */
 
-async function ghosttyRun(file, { interrupt, latency }) {
+async function ghosttyRun(file, { interrupt, latency, soak }) {
   for (const ch of ['renderer-ready', 'frame-presented']) ipcMain.removeAllListeners(ch);
 
   const scale = screen.getPrimaryDisplay().scaleFactor;
@@ -261,10 +279,10 @@ async function ghosttyRun(file, { interrupt, latency }) {
   await visible(READY, 50);
   await sleep(200);
 
-  const sampler = startMetricsSampler();
+  const sampler = startMetricsSampler({ series: !!soak });
   const result = {};
   const t0 = now();
-  if (!latency) shell.write(doneCmd(file));
+  if (!latency && !soak) shell.write(doneCmd(file));
 
   if (interrupt) {
     await sleep(INTERRUPT_MS);
@@ -274,6 +292,16 @@ async function ghosttyRun(file, { interrupt, latency }) {
     shell.write(pongCmd);
     await visible(PONG, 20);
     result.interruptMs = +(now() - tIntr).toFixed(0);
+  } else if (soak) {
+    // Sustained-output soak: loop the payload for N minutes and watch the
+    // memory trend. Scrollback is capped, so steady state must be flat.
+    shell.write(`while :; do cat ${file}; done\r`);
+    await sleep(SOAK_MIN * 60_000);
+    const ctrlC = addon.encodeKey(term.session, { code: 'KeyC', ctrl: true, utf8: 'c' });
+    shell.write(ctrlC.toString('binary'));
+    await sleep(500);
+    result.soakMinutes = SOAK_MIN;
+    result.bytesConsumedMB = Math.round(chunkBytes / 1048576);
   } else if (latency) {
     // Keystroke→visible-echo latency, sampled at idle and mid-flood. The
     // echo scrolls out of the viewport within milliseconds under load, so
@@ -339,6 +367,8 @@ async function ghosttyRun(file, { interrupt, latency }) {
   }
 
   Object.assign(result, sampler.stop());
+  if (soak) result.memSlopeMBperMin = +memSlope(result.memSeries).toFixed(2);
+  if (!soak) delete result.memSeries;
   clearInterval(timer);
   if (gDebugTimer) clearInterval(gDebugTimer);
   try { shell.kill(); } catch {}
@@ -349,7 +379,7 @@ async function ghosttyRun(file, { interrupt, latency }) {
 
 /* ── xterm runner ────────────────────────────────────────────────────── */
 
-async function xtermRun(file, { interrupt, latency }) {
+async function xtermRun(file, { interrupt, latency, soak }) {
   for (const ch of ['x-ready', 'x-input', 'x-acked', 'x-found']) ipcMain.removeAllListeners(ch);
 
   const win = new BrowserWindow({
@@ -428,7 +458,14 @@ async function xtermRun(file, { interrupt, latency }) {
   const result = {};
   const t0 = now();
 
-  if (latency) {
+  if (soak) {
+    shell.write(`while :; do cat ${file}; done\r`);
+    await sleep(SOAK_MIN * 60_000);
+    shell.write('\x03');
+    await sleep(500);
+    result.soakMinutes = SOAK_MIN;
+    result.bytesConsumedMB = Math.round(sentBytes / 1048576);
+  } else if (latency) {
     // Keystroke→visible-echo latency (see the ghostty runner for the model);
     // detection deep-scans the tail of the renderer's buffer.
     const measure = async (marker) => {
@@ -485,6 +522,8 @@ async function xtermRun(file, { interrupt, latency }) {
   }
 
   Object.assign(result, sampler.stop());
+  if (soak) result.memSlopeMBperMin = +memSlope(result.memSeries).toFixed(2);
+  if (!soak) delete result.memSeries;
   if (debugTimer) clearInterval(debugTimer);
   clearInterval(flushTimer);
   try { shell.kill(); } catch {}
@@ -501,6 +540,31 @@ app.whenReady().then(async () => {
   try {
     const file = ensurePayload();
     const mb = fs.statSync(file).size / (1024 * 1024);
+
+    if (SOAK_MIN > 0) {
+      const LIMIT_MB_PER_MIN = 10;
+      console.log(`\nghostty: ${SOAK_MIN} min soak...`);
+      const g = await ghosttyRun(file, { soak: true });
+      console.log(`  consumed ${g.bytesConsumedMB} MB · mem slope ${g.memSlopeMBperMin} MB/min · cpu ${g.cpuTotal}s`);
+      console.log(`xterm: ${SOAK_MIN} min soak...`);
+      const x = await xtermRun(file, { soak: true });
+      console.log(`  consumed ${x.bytesConsumedMB} MB · mem slope ${x.memSlopeMBperMin} MB/min · cpu ${x.cpuTotal}s`);
+
+      const pass = Math.abs(g.memSlopeMBperMin) < LIMIT_MB_PER_MIN &&
+                   Math.abs(x.memSlopeMBperMin) < LIMIT_MB_PER_MIN;
+      const out = {
+        mode: 'soak', minutes: SOAK_MIN, limitMBperMin: LIMIT_MB_PER_MIN, pass,
+        ghostty: g, xterm: x,
+        electronVersion: process.versions.electron,
+        platform: process.platform, arch: process.arch
+      };
+      console.log(`\n  soak ${pass ? 'PASS' : 'FAIL'} (|mem slope| < ${LIMIT_MB_PER_MIN} MB/min after warm-up)`);
+      const resultsDir = path.join(__dirname, '..', 'results');
+      fs.mkdirSync(resultsDir, { recursive: true });
+      fs.writeFileSync(path.join(resultsDir, 'pty-soak.json'), JSON.stringify(out, null, 2));
+      app.exit(pass ? 0 : 1);
+      return;
+    }
 
     if (LATENCY) {
       console.log(`\nghostty: latency probe (${SAMPLES} samples idle + mid-flood)...`);

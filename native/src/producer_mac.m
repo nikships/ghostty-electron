@@ -548,6 +548,7 @@ static napi_value Render(napi_env env, napi_callback_info info) {
   ghostty_render_state_get(s->render_state,
                            GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE,
                            &cur_visible);
+  if (s->cursor_hidden) cur_visible = false;
   ghostty_render_state_get(s->render_state,
                            GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
                            &cur_valid);

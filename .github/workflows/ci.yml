@@ -49,6 +49,20 @@ jobs:
       - name: PTY race benchmark (64 MiB)
         run: npx electron pty-bench/main.js --mb 64 --interrupt-ms 2000
 
+      - name: Compare with previous main run
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          artifact="results-$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
+          prev=$(gh run list --workflow ci.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
+          if [ -n "$prev" ]; then
+            gh run download "$prev" -n "$artifact" -D previous-results || true
+          fi
+          node scripts/compare-results.js previous-results >> "$GITHUB_STEP_SUMMARY"
+
       - name: Job summary
         if: always()
         run: node scripts/ci-summary.js >> "$GITHUB_STEP_SUMMARY"
@@ -95,6 +109,20 @@ jobs:
 
       - name: xterm baseline benchmark (Electron under xvfb)
         run: xvfb-run --auto-servernum npx electron xterm-bench/main.js --no-sandbox
+
+      - name: Compare with previous main run
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          artifact="results-$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
+          prev=$(gh run list --workflow ci.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
+          if [ -n "$prev" ]; then
+            gh run download "$prev" -n "$artifact" -D previous-results || true
+          fi
+          node scripts/compare-results.js previous-results >> "$GITHUB_STEP_SUMMARY"
 
       - name: Job summary
         if: always()
@@ -163,6 +191,20 @@ jobs:
 
       - name: xterm baseline benchmark (Electron)
         run: npx electron xterm-bench/main.js
+
+      - name: Compare with previous main run
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          artifact="results-$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
+          prev=$(gh run list --workflow ci.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
+          if [ -n "$prev" ]; then
+            gh run download "$prev" -n "$artifact" -D previous-results || true
+          fi
+          node scripts/compare-results.js previous-results >> "$GITHUB_STEP_SUMMARY"
 
       - name: Job summary
         if: always()
