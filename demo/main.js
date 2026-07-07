@@ -9,6 +9,10 @@
  *   --smoke  echo a marker through both PTYs, verify both grids show it,
  *            write results/demo-smoke.json (+ screenshots) and exit.
  */
+if (process.platform !== 'darwin') {
+  console.error('The demo needs the native IOSurface producer (macOS-only for now).');
+  process.exit(1);
+}
 const { app, BrowserWindow, clipboard, ipcMain, screen, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');

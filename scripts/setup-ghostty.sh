@@ -12,5 +12,5 @@ fi
 cd vendor/ghostty
 echo "building libghostty-vt (zig $(zig version))..."
 zig build -Demit-lib-vt=true -Doptimize=ReleaseFast
-ls -la zig-out/lib/libghostty-vt.a
+ls -la zig-out/lib/
 echo "done."

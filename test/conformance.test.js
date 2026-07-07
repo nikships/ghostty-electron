@@ -10,30 +10,9 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 
-const addon = require(path.join(__dirname, '..', 'native', 'build', 'Release', 'ghostty_producer.node'));
-const { Terminal } = require('@xterm/headless');
+const { ghosttyGrid, xtermGrid } = require('./helpers');
 
-const COLS = 80;
 const ROWS = 24;
-
-function ghosttyGrid(input) {
-  const t = addon.create(COLS, ROWS, 13, 1);
-  addon.write(t.session, Buffer.from(input, 'utf8'));
-  return addon.getText(t.session);
-}
-
-async function xtermGrid(input) {
-  const term = new Terminal({ cols: COLS, rows: ROWS, scrollback: 10000, allowProposedApi: true });
-  await new Promise((resolve) => term.write(input, resolve));
-  const lines = [];
-  const buf = term.buffer.active;
-  for (let i = 0; i < ROWS; i++) {
-    const line = buf.getLine(buf.viewportY + i);
-    lines.push(line ? line.translateToString(true) : '');
-  }
-  term.dispose();
-  return lines;
-}
 
 async function assertGridsMatch(name, input) {
   const [g, x] = [ghosttyGrid(input), await xtermGrid(input)];
@@ -67,7 +46,7 @@ test('cursor movement (CUP/CUU/CUF/CUB)', async () => {
 });
 
 test('line wrap at right margin', async () => {
-  await assertGridsMatch('wrap', 'x'.repeat(COLS * 2 + 10));
+  await assertGridsMatch('wrap', 'x'.repeat(80 * 2 + 10));
 });
 
 test('erase in display and line (ED/EL)', async () => {

@@ -1,0 +1,117 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    name: macOS (full suite + benchmarks)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build libghostty-vt
+        run: npm run setup:ghostty
+
+      - name: Build native addon
+        run: npm run build:native
+
+      - name: Generate payload
+        run: npm run payload
+
+      - name: Unit + conformance + fuzz tests
+        run: npm test
+
+      - name: Parse benchmark (10 MiB)
+        run: npm run bench:parse -- --mb 10 --runs 3
+
+      - name: Integration tests (Electron apps, PTY race, demo smoke)
+        run: npm run test:integration
+
+      - name: In-terminal benchmark (burst + sustained)
+        run: node bench.js --runs 3
+
+      - name: PTY race benchmark (64 MiB)
+        run: npx electron pty-bench/main.js --mb 64 --interrupt-ms 2000
+
+      - name: Job summary
+        if: always()
+        run: node scripts/ci-summary.js >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-macos
+          path: results/
+          if-no-files-found: ignore
+
+  windows:
+    name: Windows (parser + xterm baseline)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build libghostty-vt
+        shell: bash
+        run: |
+          bash scripts/setup-ghostty.sh
+          # node-gyp on Windows links ghostty-vt.lib; zig may emit the unix name.
+          cd vendor/ghostty/zig-out/lib
+          if [ -f libghostty-vt.a ] && [ ! -f ghostty-vt.lib ]; then
+            cp libghostty-vt.a ghostty-vt.lib
+          fi
+          ls -la
+
+      - name: Build native addon (VT core + stub platform layer)
+        run: npm run build:native
+
+      - name: Generate payload
+        run: npm run payload
+
+      - name: Unit + conformance + fuzz tests (renderer tests skip)
+        run: npm test
+
+      - name: Parse benchmark (10 MiB)
+        run: npm run bench:parse -- --mb 10 --runs 3
+
+      - name: xterm baseline benchmark (Electron)
+        run: npx electron xterm-bench/main.js
+
+      - name: Job summary
+        if: always()
+        shell: bash
+        run: node scripts/ci-summary.js >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-windows
+          path: results/
+          if-no-files-found: ignore

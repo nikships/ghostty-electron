@@ -27,6 +27,10 @@
  *
  * Flags: --mb N (default 1024), --interrupt-ms N (default 4000), --keep-file
  */
+if (process.platform !== 'darwin') {
+  console.error('pty-bench needs the native IOSurface producer (macOS-only for now).');
+  process.exit(1);
+}
 const { app, BrowserWindow, ipcMain, screen, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');

@@ -14,6 +14,10 @@ function makeTerm(cols = 80, rows = 24, fontSize = 13, scale = 2) {
   return addon.create(cols, rows, fontSize, scale);
 }
 
+// Rendering (render/readPixels) exists only in the macOS platform layer;
+// VT state, text readout, key encoding and selection are cross-platform.
+const RENDER = process.platform === 'darwin' ? {} : { skip: 'renderer is macOS-only' };
+
 function write(t, s) {
   addon.write(t.session, Buffer.from(s, 'utf8'));
 }
@@ -51,7 +55,7 @@ test('getText reflects written content', () => {
   assert.strictEqual(lines[2], '');
 });
 
-test('render produces frames only when dirty', () => {
+test('render produces frames only when dirty', RENDER, () => {
   const t = makeTerm();
   write(t, 'hi');
   const f1 = addon.render(t.session);
@@ -66,7 +70,7 @@ test('render produces frames only when dirty', () => {
   assert.ok(addon.render(t.session), 'dirty again after write');
 });
 
-test('red SGR text produces red pixels in the right cell', () => {
+test('red SGR text produces red pixels in the right cell', RENDER, () => {
   const t = makeTerm();
   write(t, '\x1b[31mMMMM\x1b[0m');
   addon.render(t.session);
@@ -79,7 +83,7 @@ test('red SGR text produces red pixels in the right cell', () => {
   assert.strictEqual(redElsewhere, 0, 'no red pixels in an empty cell');
 });
 
-test('background color fills cell', () => {
+test('background color fills cell', RENDER, () => {
   const t = makeTerm();
   write(t, '\x1b[44m  \x1b[0m'); // blue background, two cells
   addon.render(t.session);
@@ -90,7 +94,7 @@ test('background color fills cell', () => {
   assert.ok(blue > cellArea * 0.9, `bg should fill the cell (${blue}/${cellArea})`);
 });
 
-test('block cursor is drawn', () => {
+test('block cursor is drawn', RENDER, () => {
   const t = makeTerm();
   write(t, 'ab');
   const cur = addon.getCursor(t.session);
@@ -107,7 +111,7 @@ test('block cursor is drawn', () => {
   assert.strictEqual(brightAfter, 0);
 });
 
-test('cursor movement dirties old and new rows', () => {
+test('cursor movement dirties old and new rows', RENDER, () => {
   const t = makeTerm();
   write(t, 'line1\r\nline2\r\nline3');
   addon.render(t.session);
@@ -122,7 +126,7 @@ test('cursor movement dirties old and new rows', () => {
   assert.ok(f.rowsDrawn >= 2 && f.rowsDrawn <= 4, `only cursor rows redraw (got ${f.rowsDrawn})`);
 });
 
-test('dirty-row tracking survives double buffering', () => {
+test('dirty-row tracking survives double buffering', RENDER, () => {
   const t = makeTerm();
   // Fill all rows.
   for (let i = 0; i < 24; i++) write(t, `row ${i}\r\n`);
@@ -160,9 +164,11 @@ test('resize changes grid and surface dimensions', () => {
   assert.strictEqual(lines.length, 30);
   assert.strictEqual(lines[0], 'before resize', 'content survives resize');
 
-  const f = addon.render(t.session);
-  assert.ok(f, 'resize forces a present');
-  assert.strictEqual(f.width, dims.width);
+  if (process.platform === 'darwin') {
+    const f = addon.render(t.session);
+    assert.ok(f, 'resize forces a present');
+    assert.strictEqual(f.width, dims.width);
+  }
 });
 
 test('wide characters occupy two cells', () => {
@@ -174,7 +180,7 @@ test('wide characters occupy two cells', () => {
   assert.strictEqual(cur.x, 4, 'two wide chars advance cursor by 4');
 });
 
-test('incremental rendering is pixel-identical to a full redraw', () => {
+test('incremental rendering is pixel-identical to a full redraw', RENDER, () => {
   // Any divergence means a frame depends on redraw history instead of grid
   // state — the bug class behind corrupted TUIs (glyph bleed, dirty misses).
   const COLS = 60, ROWS = 10;
@@ -213,7 +219,7 @@ test('incremental rendering is pixel-identical to a full redraw', () => {
   }
 });
 
-test('box drawing renders as geometry (aligned lines)', () => {
+test('box drawing renders as geometry (aligned lines)', RENDER, () => {
   const t = makeTerm();
   write(t, '─│█');
   addon.render(t.session);
@@ -247,7 +253,7 @@ test('box drawing renders as geometry (aligned lines)', () => {
   assert.strictEqual(full, cw * ch, 'full block fills the cell');
 });
 
-test('selection: set, render inverted, extract text, clear', () => {
+test('selection: set, render inverted, extract text, clear', RENDER, () => {
   const t = makeTerm();
   write(t, 'hello world\r\nsecond line');
 

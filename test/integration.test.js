@@ -19,6 +19,10 @@ const path = require('path');
 const ROOT = path.join(__dirname, '..');
 const electron = require('electron');
 
+// The native producer (and zsh for the PTY tests) are macOS-only for now;
+// the xterm baseline app runs everywhere Electron does.
+const MAC = process.platform === 'darwin' ? {} : { skip: 'requires the macOS producer' };
+
 function runElectron(args, timeout = 120_000) {
   execFileSync(electron, args.map(a => path.isAbsolute(a) || a.startsWith('--') || /^\d+$/.test(a) ? a : path.join(ROOT, a)), {
     cwd: ROOT,
@@ -50,7 +54,7 @@ test('xterm benchmark runs and reports sane numbers', () => {
   assert.ok(r.scale >= 1, 'reports devicePixelRatio');
 });
 
-test('ghostty benchmark runs, reports per-stage stats and a real screenshot', () => {
+test('ghostty benchmark runs, reports per-stage stats and a real screenshot', MAC, () => {
   runElectron(['ghostty-bench/main.js', '--screenshot']);
   const r = readResult('ghostty.json');
   assert.strictEqual(r.mode, 'burst');
@@ -64,7 +68,7 @@ test('ghostty benchmark runs, reports per-stage stats and a real screenshot', ()
   assert.ok(png.size > 20_000, `screenshot has content (${png.size} bytes)`);
 });
 
-test('sustained mode (5× payload) completes', () => {
+test('sustained mode (5× payload) completes', MAC, () => {
   runElectron(['ghostty-bench/main.js', '--repeat', '5'], 180_000);
   const r = readResult('ghostty.json');
   assert.strictEqual(r.mode, 'sustained');
@@ -73,7 +77,7 @@ test('sustained mode (5× payload) completes', () => {
   assert.ok(r.frames >= 2, 'multiple frames during sustained feed');
 });
 
-test('pty-bench: sentinel-timed cat race completes with sane metrics', () => {
+test('pty-bench: sentinel-timed cat race completes with sane metrics', MAC, () => {
   runElectron(['pty-bench/main.js', '--mb', '8', '--interrupt-ms', '500'], 180_000);
   const r = readResult('pty-bench.json');
   assert.ok(Math.abs(r.sizeMB - 8) < 1, 'ran the 8 MiB payload');
@@ -87,7 +91,7 @@ test('pty-bench: sentinel-timed cat race completes with sane metrics', () => {
   assert.ok(r.ghostty.ptyChunks > 100, 'pty chunk stats recorded');
 });
 
-test('demo --smoke: zsh echo round-trips through both terminals', () => {
+test('demo --smoke: zsh echo round-trips through both terminals', MAC, () => {
   runElectron(['demo/main.js', '--smoke'], 60_000);
   const r = readResult('demo-smoke.json');
   assert.strictEqual(r.ghosttyEcho, true, 'PTY output visible in ghostty grid');

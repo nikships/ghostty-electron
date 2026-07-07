@@ -12,6 +12,10 @@
  * Flags: --repeat N (sustained mode, feeds the payload N times),
  *        --screenshot (dump final frame to results/).
  */
+if (process.platform !== 'darwin') {
+  console.error('This benchmark needs the native IOSurface producer (macOS-only for now).');
+  process.exit(1);
+}
 const { app, BrowserWindow, ipcMain, screen, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');
