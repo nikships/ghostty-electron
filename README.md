@@ -51,26 +51,41 @@ backlogged terminal happens far earlier. A separate run measures
 of a fresh `echo` is visible — i.e. how fast you get your terminal back.
 
 ```
-  terminal         cat ms     MB/s   Ctrl+C→PONG ms    cpu s  peak mem MB
+  terminal         cat ms     MB/s   Ctrl+C→PONG ms    cpu s  mem growth MB
   ──────────────────────────────────────────────────────────────────────────────────
-  xterm           1242060      0.8              729    81.73          797
-  ghostty          104380      9.8               28    15.23          463
+  xterm             54948     18.6             1007     5.86          369
+  ghostty           24629     41.6               48     2.77           49
   ──────────────────────────────────────────────────────────────────────────────────
-  cat speedup: 11.9×   interrupt speedup: 26.0×
+  cat speedup: 2.2×   interrupt speedup: 21×
 ```
 
-xterm: **20.7 minutes**. ghostty: **1.7 minutes** — and Ctrl+C answers in
-28 ms vs 729 ms, at 5.4× less total CPU. (Wall times vary run-to-run with
-system load; the ratios are stable. Note node-pty delivers ~1 KB chunks, so
-the PTY plumbing itself caps throughput well below the parsers' raw speed —
-a control run reports this "pipe ceiling" alongside the results.)
+(Attended run, display awake, `caffeinate`.) Through a real PTY the picture
+changes from the raw benchmarks: node-pty delivers ~1 KB chunks and the
+plumbing caps throughput far below the parsers' raw speed (a control run
+reports this "pipe ceiling" — ~50–65 MB/s — alongside the results), so the
+**completion-time gap compresses to ~2×** and at small sizes (≤8 MiB)
+vanishes entirely. The metrics that stay dramatic at scale are the
+*responsiveness* ones: **Ctrl+C mid-flood answers in ~50 ms vs ~1 s** (the
+renderer must chew its flow-control backlog before your keystroke's effect
+appears), at ~2× less CPU and ~7× less memory growth.
 
 Methodology details baked into `pty-bench/`: `zsh -f` + an explicit READY
 handshake (rc-file startup would otherwise pollute the timing), sentinel
 values written as `$((…))` so the echoed command line can't false-match,
 VS Code-style flow control + 4 ms batching on the xterm IPC path (without
-it, per-chunk IPC collapses and a 1 GiB flood OOMs the renderer), and
-`app.getAppMetrics()` sampling for CPU/memory.
+it, per-chunk IPC collapses and a 1 GiB flood OOMs the renderer),
+`backgroundThrottling: false` on every window, bounded (never rAF-blocking)
+visibility detection on both sides, and `app.getAppMetrics()` sampling for
+CPU/memory with baseline subtraction.
+
+**A cautionary tale we hit ourselves:** an unattended overnight run reported
+xterm at 20.7 minutes (11.9× slower). The debug logs showed all data was
+parsed by ~150 s — the remaining ~18 minutes was our sentinel detector
+waiting on a `requestAnimationFrame` that Chromium had suspended for the
+occluded window, plus App Nap throttling everything. If a terminal benchmark
+(or terminal app!) relies on rAF/timers in a window that might be occluded,
+the numbers are fiction. This is why VS Code ships
+`backgroundThrottling: false`.
 
 **Reading the numbers:**
 - The dominant cost of `cat`-ing a file is the **VT parser**, not pixels.

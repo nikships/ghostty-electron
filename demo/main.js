@@ -51,6 +51,7 @@ app.whenReady().then(async () => {
     title: 'libghostty + sharedTexture',
     webPreferences: {
       sandbox: true,
+      backgroundThrottling: false,
       preload: path.join(__dirname, 'preload-ghostty.js')
     }
   });
@@ -220,6 +221,7 @@ app.whenReady().then(async () => {
     title: 'xterm.js + WebGL',
     webPreferences: {
       nodeIntegration: true,
+      backgroundThrottling: false,
       contextIsolation: false
     }
   });

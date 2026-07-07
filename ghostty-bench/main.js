@@ -51,6 +51,7 @@ app.whenReady().then(async () => {
     show: true,
     webPreferences: {
       sandbox: true,
+      backgroundThrottling: false,
       preload: path.join(__dirname, 'preload.js')
     }
   });

@@ -23,6 +23,7 @@ app.whenReady().then(async () => {
     show: true,
     webPreferences: {
       nodeIntegration: true,
+      backgroundThrottling: false,
       contextIsolation: false
     }
   });

@@ -30,7 +30,8 @@
 
     // Scan on an interval (not just render/write events) so detection can't
     // stall when output stops.
-    setInterval(() => { lastScan = 0; scanForMarker(); }, 50);
+    let scanIntervalMs = 50;
+    let scanTimer = setInterval(() => { lastScan = 0; scanForMarker(); }, scanIntervalMs);
 
     let debugScans = 0;
     function scanForMarker() {
@@ -52,10 +53,13 @@
         if (line && line.translateToString(true).trim().endsWith(watchMarker)) {
           const marker = watchMarker;
           watchMarker = null;
-          // Report only once the frame containing the marker was presented.
-          requestAnimationFrame(() => requestAnimationFrame(() => {
-            ipcRenderer.send('x-found', marker);
-          }));
+          // Report once the frame containing the marker was presented: two
+          // rAFs, but raced against a timeout so a throttled/occluded
+          // compositor can only delay the report, never hang it.
+          let sent = false;
+          const report = () => { if (!sent) { sent = true; ipcRenderer.send('x-found', marker); } };
+          requestAnimationFrame(() => requestAnimationFrame(report));
+          setTimeout(report, 100);
           return;
         }
       }
@@ -87,9 +91,14 @@
       });
     });
 
-    ipcRenderer.on('x-watch', (event, { marker }) => {
+    ipcRenderer.on('x-watch', (event, { marker, pollMs }) => {
       watchMarker = marker;
       lastScan = 0;
+      if (pollMs && pollMs !== scanIntervalMs) {
+        scanIntervalMs = pollMs;
+        clearInterval(scanTimer);
+        scanTimer = setInterval(() => { lastScan = 0; scanForMarker(); }, scanIntervalMs);
+      }
     });
 
     ipcRenderer.send('x-ready');

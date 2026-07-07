@@ -96,7 +96,8 @@ function ensurePayload() {
 function startMetricsSampler() {
   const cpuSeconds = {};
   let peakMemMB = 0;
-  app.getAppMetrics(); // reset percentCPUUsage baseline
+  const baseline = app.getAppMetrics() // also resets percentCPUUsage baseline
+    .reduce((sum, p) => sum + (p.memory.workingSetSize || 0) / 1024, 0);
   let last = now();
   const timer = setInterval(() => {
     const t = now();
@@ -108,14 +109,19 @@ function startMetricsSampler() {
       mem += (p.memory.workingSetSize || 0) / 1024; // KB → MB
     }
     peakMemMB = Math.max(peakMemMB, mem);
-  }, 500);
+  }, 250);
   return {
     stop() {
       clearInterval(timer);
       const total = Object.values(cpuSeconds).reduce((a, b) => a + b, 0);
       const rounded = Object.fromEntries(
         Object.entries(cpuSeconds).map(([k, v]) => [k, +v.toFixed(2)]));
-      return { cpuSeconds: rounded, cpuTotal: +total.toFixed(2), peakMemMB: Math.round(peakMemMB) };
+      return {
+        cpuSeconds: rounded,
+        cpuTotal: +total.toFixed(2),
+        // Growth over the app's pre-run footprint, not absolute WSS.
+        peakMemMB: Math.round(Math.max(0, peakMemMB - baseline))
+      };
     }
   };
 }
@@ -151,6 +157,9 @@ async function ghosttyRun(file, { interrupt }) {
     title: `ghostty pty-bench${interrupt ? ' (interrupt probe)' : ''}`,
     webPreferences: {
       sandbox: true,
+      // Never let Chromium throttle rAF/timers when occluded: frame acks
+      // (and thus presentation) must keep running unattended.
+      backgroundThrottling: false,
       preload: path.join(__dirname, '..', 'demo', 'preload-ghostty.js')
     }
   });
@@ -216,9 +225,17 @@ async function ghosttyRun(file, { interrupt }) {
       if (lines.some((l) => l.trim().endsWith(marker))) break;
       await sleep(pollMs);
     }
-    const seqAtDetect = seq;
+    // The sentinel is in the grid; wait (bounded) until the present loop has
+    // gone idle — no new frames for ~3 ticks and every sent frame acked — so
+    // the clock stops at "visible", not "parsed".
     const t = now();
-    while (maxAcked < seqAtDetect && now() - t < 1000) await sleep(5);
+    let stableSeq = seq, stableAt = now();
+    while (now() - t < 1000) {
+      if (seq !== stableSeq) { stableSeq = seq; stableAt = now(); }
+      if (surfaceSeq[0] <= maxAcked && surfaceSeq[1] <= maxAcked &&
+          now() - stableAt > 25) break;
+      await sleep(5);
+    }
     return now();
   }
 
@@ -242,7 +259,7 @@ async function ghosttyRun(file, { interrupt }) {
     await visible(PONG, 20);
     result.interruptMs = +(now() - tIntr).toFixed(0);
   } else {
-    await visible(DONE, 100);
+    await visible(DONE, 50);
     result.catMs = +(now() - t0).toFixed(0);
     result.ptyChunks = chunks;
     result.avgChunkBytes = Math.round(chunkBytes / Math.max(1, chunks));
@@ -266,7 +283,10 @@ async function xtermRun(file, { interrupt }) {
     width: 1100,
     height: 620,
     title: `xterm pty-bench${interrupt ? ' (interrupt probe)' : ''}`,
-    webPreferences: { nodeIntegration: true, contextIsolation: false }
+    // backgroundThrottling: an occluded window otherwise gets its rAF
+    // suspended and setTimeout clamped — it silently poisoned an overnight
+    // run with ~18 minutes of "waiting for a frame". VS Code disables it too.
+    webPreferences: { nodeIntegration: true, contextIsolation: false, backgroundThrottling: false }
   });
 
   const shell = pty.spawn(SHELL, SHELL_ARGS, {
@@ -308,10 +328,10 @@ async function xtermRun(file, { interrupt }) {
   await ready;
   win.webContents.send('x-config', { cols: COLS, rows: ROWS, fontSize: FONT_SIZE });
 
-  function visible(marker) {
+  function visible(marker, pollMs = 50) {
     return new Promise((resolve) => {
       ipcMain.on('x-found', (e, m) => { if (m === marker) resolve(now()); });
-      win.webContents.send('x-watch', { marker });
+      win.webContents.send('x-watch', { marker, pollMs });
     });
   }
 
@@ -330,7 +350,7 @@ async function xtermRun(file, { interrupt }) {
   const t0 = now();
 
   if (interrupt) {
-    const found = visible(PONG);
+    const found = visible(PONG, 20);
     shell.write(doneCmd(file));
     await sleep(INTERRUPT_MS);
     const tIntr = now();
@@ -339,7 +359,7 @@ async function xtermRun(file, { interrupt }) {
     await found;
     result.interruptMs = +(now() - tIntr).toFixed(0);
   } else {
-    const found = visible(DONE);
+    const found = visible(DONE, 50);
     shell.write(doneCmd(file));
     await found;
     result.catMs = +(now() - t0).toFixed(0);
