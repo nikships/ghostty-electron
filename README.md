@@ -52,8 +52,13 @@ The identical byte stream through both VT engines in plain Node:
 
 | | xterm.js headless | libghostty-vt | ratio |
 |---|---|---|---|
-| macOS arm64 | 20.1 MB/s | 219.3 MB/s | **10.9×** |
-| Windows x64 (CI) | _see CI job summary_ | _see CI job summary_ | ~10× |
+| macOS arm64 (M-series) | 20.1 MB/s | 219.3 MB/s | **10.9×** |
+| Windows x64 (CI runner) | 4.0 MB/s | 98.5 MB/s | **24.4×** |
+
+The gap *widens* on Windows: the native parser loses less to the slower
+hardware than the JS one does. (Windows numbers come from the GitHub-hosted
+runner via CI — see any run's job summary; the Windows xterm-in-Electron
+baseline also runs there: 1 MiB burst ≈ 423 ms e2e.)
 
 ### 2. In-terminal flood — `npm run bench` (Electron, macOS)
 
