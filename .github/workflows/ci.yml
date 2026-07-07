@@ -117,7 +117,12 @@ jobs:
         run: npm run bench:parse -- --mb 10 --runs 3
 
       - name: xterm baseline benchmark (Electron under xvfb)
-        run: xvfb-run --auto-servernum npx electron --no-sandbox xterm-bench/main.js
+        # SwiftShader WebGL2 is blocklisted by default on GPU-less machines;
+        # both flags are required for the WebGL addon to initialize.
+        run: >
+          xvfb-run --auto-servernum npx electron --no-sandbox
+          --enable-unsafe-swiftshader --ignore-gpu-blocklist
+          xterm-bench/main.js
 
       - name: Compare with previous main run
         if: always()
