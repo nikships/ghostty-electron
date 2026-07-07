@@ -1,214 +1,223 @@
 # ghostty-xterm-bench
 
-`cat` a file in an Electron terminal, two ways:
+A fair, measured comparison of two terminal architectures inside Electron:
 
-1. **xterm.js + WebGL addon** — parse *and* render inside the Chromium renderer
-   process (this is how VS Code's terminal works today).
+1. **xterm.js + WebGL addon** — parse *and* render inside the Chromium
+   renderer process. This is how VS Code's integrated terminal works today.
 2. **libghostty-vt + sharedTexture** — [libghostty-vt](https://github.com/ghostty-org/ghostty)
-   parses the VT stream in the main process, a native addon draws the grid with
-   CoreText into an **IOSurface** (HiDPI, dirty-row incremental), and Electron's
-   `sharedTexture` module transfers it **zero-copy** into a sandboxed renderer
+   (ghostty's native VT engine) parses in the main process, a native addon
+   draws the grid into an **IOSurface**, and Electron's `sharedTexture`
+   module transfers it **zero-copy** into a fully sandboxed renderer
    `<canvas>` as a `VideoFrame`.
 
-Same payload, same 120×30 grid, same physical pixel count (both render at
-`devicePixelRatio`), same finish line (frame confirmed presented via
-double-`requestAnimationFrame`). Everything is measured; nothing is modeled.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks-dark.svg">
+  <img alt="Benchmark results: parser throughput 11x, 10MiB flood 18x, 1GiB PTY cat 2.2x, Ctrl+C response 21x in ghostty's favor" src="assets/benchmarks-light.svg">
+</picture>
 
-## Results (macOS arm64, M-series @2x, Electron 42.5.0 / Chromium 148)
+## Motivation
 
-**Burst — cat 1 MiB once** (median of 3):
+VS Code's terminal keeps everything — VT parsing, buffer state, rendering —
+on the renderer process's JavaScript thread. That has two structural costs:
+heavy output floods are parse-bound in JS, and they saturate the same thread
+that handles your keystrokes, so the terminal feels worst exactly when it's
+busiest. Proposals to swap in a native terminal engine were historically
+dismissed as "you'd have to fork Chromium to get native pixels into the DOM"
+(microsoft/vscode#236991 was closed as out of scope).
 
-```
-  backend                                         parse ms    e2e ms    MB/s  frames
-  ──────────────────────────────────────────────────────────────────────────────────
-  xterm.js + WebGL (in-renderer DOM)                 104.6     113.7     8.8      14
-  libghostty-vt + IOSurface + sharedTexture            8.1      20.9    47.8       2
-  ──────────────────────────────────────────────────────────────────────────────────
-  parse speedup: 12.9×   e2e speedup: 5.4×
-```
+That premise changed: Electron ≥41 ships a `sharedTexture` module that turns
+a native GPU surface (macOS `IOSurface`, Windows D3D11 `NT HANDLE`, Linux
+dmabuf) into a W3C `VideoFrame` the sandboxed renderer can paint zero-copy —
+the same path `<video>` and WebRTC frames use. So the interesting question
+became answerable without forking anything:
 
-**Sustained — cat 1 MiB ×10 back-to-back** (median of 3):
+> If a native terminal engine parsed in the main process and shipped frames
+> to the DOM via sharedTexture, how would it actually compare to xterm.js —
+> measured end-to-end, fairly?
 
-```
-  backend                                         parse ms    e2e ms    MB/s  frames
-  ──────────────────────────────────────────────────────────────────────────────────
-  xterm.js + WebGL (in-renderer DOM)                1170.2    1183.3     8.5     129
-  libghostty-vt + IOSurface + sharedTexture           53.6      65.1   153.7       5
-  ──────────────────────────────────────────────────────────────────────────────────
-  parse speedup: 21.8×   e2e speedup: 18.2×
-  ghostty per-stage: write 44.8ms · render 2.8ms · send 6.3ms · present p50 15.9ms
-```
+This repo is that measurement: both terminals run in the same Electron
+(42.5.0), on the same payloads, with the same grid (120×30 at
+`devicePixelRatio`), and finish lines that mean "the frame was actually
+presented", not "the bytes were swallowed".
 
-Reproduce with `npm run bench`. Numbers land in `results/summary.json`.
+## The three benchmark layers
 
-## The end-to-end race: `cat` 1 GiB in a real shell
+Each layer isolates one slice of the stack. All numbers below: macOS,
+Apple Silicon (M-series) @2x, attended runs, medians. Reproduce with the
+commands shown; raw JSON lands in `results/`.
 
-`npm run bench:pty` is the full-stack metric: a real zsh on a real PTY
-(node-pty), timed from issuing `cat <1 GiB file>` until the completion
-sentinel is **visible on screen** — not when `cat` exits, which on a
-backlogged terminal happens far earlier. A separate run measures
-**interrupt-to-response**: Ctrl+C mid-flood, then how long until the output
-of a fresh `echo` is visible — i.e. how fast you get your terminal back.
+### 1. Parser only — `npm run bench:parse` (any OS, no GUI)
 
-```
-  terminal         cat ms     MB/s   Ctrl+C→PONG ms    cpu s  mem growth MB
-  ──────────────────────────────────────────────────────────────────────────────────
-  xterm             54948     18.6             1007     5.86          369
-  ghostty           24629     41.6               48     2.77           49
-  ──────────────────────────────────────────────────────────────────────────────────
-  cat speedup: 2.2×   interrupt speedup: 21×
-```
+The identical byte stream through both VT engines in plain Node:
 
-(Attended run, display awake, `caffeinate`.) Through a real PTY the picture
-changes from the raw benchmarks: node-pty delivers ~1 KB chunks and the
-plumbing caps throughput far below the parsers' raw speed (a control run
-reports this "pipe ceiling" — ~50–65 MB/s — alongside the results), so the
-**completion-time gap compresses to ~2×** and at small sizes (≤8 MiB)
-vanishes entirely. The metrics that stay dramatic at scale are the
-*responsiveness* ones: **Ctrl+C mid-flood answers in ~50 ms vs ~1 s** (the
-renderer must chew its flow-control backlog before your keystroke's effect
-appears), at ~2× less CPU and ~7× less memory growth.
+| | xterm.js headless | libghostty-vt | ratio |
+|---|---|---|---|
+| macOS arm64 | 20.1 MB/s | 219.3 MB/s | **10.9×** |
+| Windows x64 (CI) | _see CI job summary_ | _see CI job summary_ | ~10× |
 
-Methodology details baked into `pty-bench/`: `zsh -f` + an explicit READY
-handshake (rc-file startup would otherwise pollute the timing), sentinel
-values written as `$((…))` so the echoed command line can't false-match,
-VS Code-style flow control + 4 ms batching on the xterm IPC path (without
-it, per-chunk IPC collapses and a 1 GiB flood OOMs the renderer),
-`backgroundThrottling: false` on every window, bounded (never rAF-blocking)
-visibility detection on both sides, and `app.getAppMetrics()` sampling for
-CPU/memory with baseline subtraction.
+### 2. In-terminal flood — `npm run bench` (Electron, macOS)
 
-**A cautionary tale we hit ourselves:** an unattended overnight run reported
-xterm at 20.7 minutes (11.9× slower). The debug logs showed all data was
-parsed by ~150 s — the remaining ~18 minutes was our sentinel detector
-waiting on a `requestAnimationFrame` that Chromium had suspended for the
-occluded window, plus App Nap throttling everything. If a terminal benchmark
-(or terminal app!) relies on rAF/timers in a window that might be occluded,
-the numbers are fiction. This is why VS Code ships
-`backgroundThrottling: false`.
+Feed the payload directly to each terminal at full speed and stop the clock
+when the final frame is confirmed presented (double-rAF / frame ack):
 
-**Reading the numbers:**
-- The dominant cost of `cat`-ing a file is the **VT parser**, not pixels.
-- The gap *widens* under sustained load: ghostty finishes the whole 10 MiB in
-  65 ms — before xterm is 6% through its parse. The native renderer is nearly
-  free (2.8 ms total draw time) thanks to dirty-row tracking + glyph runs.
-- Per-frame present latency of the sharedTexture path is ~1 vsync (p50 ≈ 16 ms),
-  measured send → consumer double-rAF ack.
-- Frame counts differ because total wall time differs; both present at display
-  cadence while working.
+| mode | xterm.js parse / e2e | ghostty parse / e2e | e2e speedup |
+|---|---|---|---|
+| burst (1 MiB) | 104.6 / 113.7 ms | 8.1 / 20.9 ms | **5.4×** |
+| sustained (10 MiB) | 1170 / 1183 ms | 53.6 / 65.1 ms | **18.2×** |
 
-## Try it yourself — interactive demo
+ghostty's native draw cost for the entire sustained run is ~3 ms — dirty-row
+tracking plus glyph runs make presentation nearly free; the gap is the parser.
 
-```bash
-npm run demo
-```
+### 3. The full-stack PTY race — `npm run bench:pty` (Electron, macOS)
 
-Two windows open side by side, each running **your real shell** via node-pty:
-left = xterm.js + WebGL, right = libghostty + sharedTexture (stats overlay in
-the corner: fps, native draw ms, present latency). Things worth feeling:
+A real zsh on a real PTY (node-pty). `cat` a 1 GiB file; the clock stops when
+the completion sentinel is **visible on screen**. A separate run measures
+interrupt recovery: Ctrl+C mid-flood, then time until a fresh echo is visible.
 
-```bash
-time cat payload.txt        # the benchmark, live
-find / 2>/dev/null | head -100000
-yes | head -1000000
-vim / less / htop           # arrows work via mode-aware key encoding (DECCKM)
-```
+| terminal | cat 1 GiB | MB/s | Ctrl+C→response | CPU | mem growth |
+|---|---|---|---|---|---|
+| xterm.js | 54.9 s | 18.6 | 1007 ms | 5.9 s | 369 MB |
+| ghostty | **24.6 s** | 41.6 | **48 ms** | 2.8 s | 49 MB |
 
-Scroll wheel scrolls ghostty's real scrollback; mouse-drag selects (rendered
-inverted, extracted via ghostty's formatter API); Cmd+C copies the selection;
-Cmd+V pastes.
+Through a real PTY the plumbing dominates: node-pty delivers ~1 KB chunks and
+caps the pipe at ~50–65 MB/s (a control run reports this ceiling), so the
+completion gap compresses to **2.2×** — and at small sizes (≤8 MiB) vanishes
+entirely. The metrics that stay dramatic are the responsiveness ones:
+**21× faster interrupt recovery** (xterm has to chew its flow-control backlog
+before your keystroke's effect appears), at ~2× less CPU and ~7× less memory
+growth. This is the honest headline: *architecture buys you latency under
+load more than it buys you raw completion time.*
 
-## Architecture
+### Feel it yourself — `npm run demo` (macOS)
 
-```
-xterm baseline:   PTY ──IPC──▶ xterm.js parser ──▶ WebGL atlas renderer ──▶ DOM canvas
-                               └────────── all inside the renderer process ──────────┘
+Two windows, each a real interactive shell: left xterm.js, right ghostty
+(with mouse selection, Cmd+C/Cmd+V, scrollback, mode-aware arrow keys for
+vim/less, stats overlays). Run `time cat payload.txt`, `find /`, or hold a
+key in vim, side by side.
 
-ghostty path:     PTY ──▶ libghostty-vt (main proc, native) ──▶ CoreText → IOSurface
-                          importSharedTexture → sendSharedTexture ──▶ sandboxed renderer
-                          getVideoFrame() ──▶ ctx.drawImage(frame) → <canvas>  (zero-copy)
-                  keys:  DOM keydown ──IPC──▶ ghostty_key_encoder (mode-aware) ──▶ PTY
-```
+## Platform matrix
 
-The ghostty-side renderer implements: fg/bg colors (palette + truecolor),
-bold (incl. bold-in-bright-colors), italic, inverse, faint, underline,
-strikethrough, wide chars/graphemes (CJK, emoji), cursor (block/bar/underline/
-hollow), **geometric box-drawing/block/braille glyphs** (font fallback
-misaligns these ranges — every terminal custom-draws them), mouse selection
-with copy, scrollback viewport, resize, HiDPI, double-buffered IOSurfaces with
-dirty-row-only redraws (row draws are clipped, and incremental output is
-test-enforced to be pixel-identical to a full redraw). The renderer stays
-fully **sandboxed** — no native code in the renderer; it only receives a GPU
-texture handle per frame. The demo additionally gates IOSurface reuse on
-consumer acks so a surface is never repainted while the compositor may still
-be reading it.
+| | macOS (arm64) | Windows (x64) | Linux |
+|---|---|---|---|
+| libghostty-vt build (zig) | ✅ | ✅ | untested |
+| parser benchmark + conformance/fuzz tests | ✅ | ✅ | untested |
+| xterm.js baseline benchmark | ✅ | ✅ | untested |
+| native presentation (sharedTexture producer) | ✅ IOSurface + CoreText | ⬜ needs a D3D11 + DirectWrite port | ⬜ needs dmabuf |
+| PTY race + interactive demo | ✅ | ⬜ (ConPTY + producer port) | ⬜ |
 
-**Non-goals (so far):** links, search, IME composition, ligatures, kitty
-graphics, blinking cursor. None of these affect the parse/present numbers
-above.
+The addon is split accordingly: `native/src/vt.c` (session, parsing, text
+readout, key encoding, selection) builds everywhere; `producer_mac.m` is the
+macOS presentation layer; `producer_stub.c` covers other platforms until
+their producers exist. Electron's `sharedTexture` API takes a D3D11
+`ntHandle` on Windows, so the port is "same architecture, different platform
+APIs" — not a redesign.
+
+## Fairness engineering
+
+Getting these numbers to mean something was most of the work. Everything
+below is baked into the harnesses because we hit it:
+
+- **Same pixels:** both render at `devicePixelRatio` (an early version ran
+  ghostty at 1× — a 4× pixel discount, in ghostty's favor, fixed).
+- **Same finish line:** "sentinel visible on screen", detected in the grid
+  and confirmed presented — never "cat exited", which on a backlogged
+  terminal happens minutes early.
+- **Flow control for xterm:** VS Code-style PTY pause/resume + 4 ms IPC
+  batching. Without it, per-chunk IPC collapses xterm's throughput ~250×
+  and a 1 GiB flood OOMs the renderer. ghostty needs neither — main-process
+  parse gives inherent backpressure.
+- **`zsh -f` + READY handshake:** rc-file startup otherwise buffers the
+  command for seconds and pollutes t₀.
+- **`backgroundThrottling: false` everywhere:** an occluded window gets its
+  rAF suspended — an unattended overnight run once reported xterm 11.9×
+  slower at 1 GiB when ~18 of its 20 minutes were our detector waiting for a
+  frame Chromium had parked. The corrected, attended number is 2.2×. (VS
+  Code disables backgroundThrottling for the same class of reason.)
+- **Inert sentinels:** written as `$((…))` arithmetic so the echoed command
+  line can never false-match; matched with `endsWith` so a missing trailing
+  newline can't hang detection.
+- **Pipe-ceiling control:** the same file through node-pty into a no-op
+  consumer, reported next to the results, so pipe-bound results are legible
+  as such.
+
+## What's proven, and how
+
+Four test layers (`npm test` + `npm run test:integration`, all in CI):
+
+1. **Addon tests** — pixel-level assertions against the actual IOSurface
+   (`readPixels`): SGR colors land in the right cells, cursor drawn, box
+   drawing renders as aligned geometry; dirty tracking across double
+   buffering; scrollback; resize; selection; **mode-aware key encoding**
+   (ArrowUp flips `\e[A`→`\eOA` under DECCKM, like vim expects).
+2. **Render-equivalence invariant** — after any incremental update sequence,
+   the frame must be pixel-identical to a from-scratch full redraw. This is
+   the regression net for the entire "corrupted TUI" bug class (glyph bleed,
+   dirty-tracking misses) — we caught real bugs with it.
+3. **Conformance + fuzz** — curated VT streams *and* 40 seeded random
+   streams diffed row-by-row against `@xterm/headless` (the exact emulator
+   VS Code ships), including the full 1 MiB benchmark payload. The speed
+   comparison only counts because both engines demonstrably do the same
+   work. The fuzzer found one genuine divergence — **DECRC after a DECSTBM
+   scroll** (ghostty restores the absolute saved row, xterm.js the
+   scroll-adjusted one) — which is pinned in a dedicated test so a behavior
+   change in either engine surfaces.
+4. **Electron integration** — the real apps run end-to-end on CI: both
+   benchmarks produce sane per-stage stats and screenshots, the PTY race
+   completes at 8 MiB with valid metrics, and the demo round-trips a live
+   zsh echo through both keyboard→PTY→parser→render pipelines.
+
+CI runs the full suite on macOS (Apple Silicon runner, including the
+Electron GUI apps and benchmarks — numbers in each run's job summary) and
+the portable subset plus xterm baseline on Windows.
+
+Worth adding as follow-ups: input-to-glass latency probes with an external
+clock, long-run soak tests for leaks (the CPU/mem sampling is a start), a
+Linux job, and tracking benchmark history across commits.
 
 ## Run it
 
-Requires macOS (arm64 tested), Node ≥ 20, Xcode CLT, and [zig](https://ziglang.org)
-matching ghostty's pinned version (0.15.2 at time of writing).
+macOS (arm64 tested) — Node ≥ 20, Xcode CLT, [zig](https://ziglang.org)
+matching ghostty's pin (0.15.2):
 
 ```bash
-npm install            # also fixes the exec bit npm strips from node-pty's spawn-helper
+npm install
 npm run payload        # generate the 1 MiB test file
 npm run setup:ghostty  # clone ghostty into vendor/ and build libghostty-vt
-npm run build:native   # build the N-API IOSurface producer addon
-npm run bench          # burst + sustained comparison table
+npm run build:native   # build the N-API addon
+npm test               # addon + conformance + fuzz (fast, no GUI)
+npm run bench:parse    # parser-only comparison (any OS)
+npm run bench          # in-terminal burst + sustained (Electron)
+npm run bench:pty      # the 1 GiB PTY race (add --mb 64 for a quick run)
 npm run demo           # side-by-side live shells
 ```
 
-## Tests
-
-```bash
-npm test                    # fast, no GUI: addon + conformance (node:test)
-npm run test:integration    # launches real Electron apps (windows will flash)
-```
-
-Three layers:
-
-1. **Addon tests** (`test/addon.test.js`) — plain Node against the native
-   addon: pixel assertions via `readPixels()` (SGR colors land in the right
-   cells, bg fills, block cursor drawn), grid text via `getText()`, dirty
-   tracking across double buffering, scrollback, resize, wide chars, and
-   **mode-aware key encoding** (ArrowUp flips `\e[A` → `\eOA` when the app
-   enables DECCKM, like vim).
-2. **Conformance tests** (`test/conformance.test.js`) — identical VT streams
-   into libghostty-vt and `@xterm/headless` (VS Code's exact emulator), grids
-   diffed row-by-row: cursor movement, wraps, erases, scroll regions, tabs,
-   CJK, alt screen, scrollback overflow, **and the full 1 MiB benchmark
-   payload**. This is the correctness go/no-go: the speed comparison only
-   means something if both emulators do the same work.
-3. **Integration tests** (`test/integration.test.js`) — spawns the real
-   Electron apps: both benchmarks produce sane per-stage numbers and screenshots,
-   sustained mode works, and the demo's `--smoke` mode round-trips a `zsh`
-   echo through both PTY→parser→renderer pipelines.
+On Windows, the same steps run everything except `bench`, `bench:pty`, and
+`demo` (they need the macOS producer for the ghostty side).
 
 ## Layout
 
 ```
-scripts/gen-payload.js     1 MiB newline-dense payload with SGR colors
-scripts/setup-ghostty.sh   clone + build libghostty-vt (static) into vendor/
-native/                    N-API addon: libghostty-vt + CoreText → IOSurface
-                           (+ key encoder, scrollback, resize, test hooks)
+native/src/vt.c            platform-independent libghostty-vt session (all OSes)
+native/src/producer_mac.m  macOS: CoreText → IOSurface presentation layer
+native/src/producer_stub.c non-mac: VT-only until a platform producer exists
+scripts/                   payload gen, ghostty build, parse bench, chart gen
 xterm-bench/               baseline Electron app (xterm.js + WebGL addon)
 ghostty-bench/             sharedTexture Electron app (producer in main process)
-pty-bench/                 end-to-end race: cat 1 GiB in a real zsh, sentinel-timed
-demo/                      side-by-side interactive demo (node-pty shells)
-test/                      addon + conformance + integration suites
-bench.js                   unified runner (burst + sustained) + table
+pty-bench/                 end-to-end race: cat via real PTYs, sentinel-timed
+demo/                      side-by-side interactive shells (node-pty)
+test/                      addon, conformance, fuzz, integration suites
+bench.js                   in-terminal runner (burst + sustained) + table
 ```
 
 ## Caveats
 
-- libghostty-vt is alpha; its header warns of breaking changes. Pin the vendor
-  checkout if you need stability.
-- The native renderer is a CPU rasterizer into an IOSurface. It's already fast
-  enough to be invisible in the numbers; ghostty's real GPU renderer (not yet
-  exposed via libghostty) would lower frame cost further at high fps.
-- No PTY in the *benchmark* path (raw bytes, so both parsers see identical
-  input, and kernel PTY buffering stays out of the measurement). The *demo*
-  uses real PTYs.
+- libghostty-vt is alpha; its headers warn of breaking changes. Pin the
+  vendor checkout for stability.
+- The macOS renderer is a CPU rasterizer into an IOSurface — already cheap
+  enough (~sub-ms/frame incremental) to vanish in these numbers; ghostty's
+  real GPU renderer isn't exposed through libghostty yet.
+- Not implemented (doesn't affect the numbers): links, search, IME
+  composition, ligatures, kitty graphics, blinking cursor.
+- Absolute wall times vary with machine load; the per-run pairings and the
+  ratios are the stable result. Every table above says which run produced it,
+  and CI reproduces the small/medium configurations on every push.

@@ -86,9 +86,13 @@ jobs:
       - name: Build libghostty-vt
         shell: bash
         run: |
-          bash scripts/setup-ghostty.sh
-          # node-gyp on Windows links ghostty-vt.lib; zig may emit the unix name.
-          cd vendor/ghostty/zig-out/lib
+          git clone --depth 1 https://github.com/ghostty-org/ghostty vendor/ghostty
+          cd vendor/ghostty
+          # Explicit msvc ABI: zig's default gnu-ABI objects break link.exe's
+          # default-CRT resolution (unresolved malloc/calloc everywhere).
+          zig build -Demit-lib-vt=true -Doptimize=ReleaseFast -Dtarget=x86_64-windows-msvc
+          cd zig-out/lib
+          # node-gyp links ghostty-vt.lib; zig may emit the unix archive name.
           if [ -f libghostty-vt.a ] && [ ! -f ghostty-vt.lib ]; then
             cp libghostty-vt.a ghostty-vt.lib
           fi
