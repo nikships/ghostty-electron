@@ -58,6 +58,15 @@ struct WinState {
 
 WinState *ws(Session *s) { return static_cast<WinState *>(s->win); }
 
+// GHOSTTY_INIT_SIZED expands to a C compound literal, which C++ rejects
+// (MSVC C4576); this is the C++-safe equivalent.
+template <typename T>
+T init_sized() {
+  T v{};
+  v.size = sizeof(T);
+  return v;
+}
+
 D2D1_COLOR_F rgb(GhosttyColorRgb c, float a = 1.0f) {
   return D2D1::ColorF(c.r / 255.0f, c.g / 255.0f, c.b / 255.0f, a);
 }
@@ -143,7 +152,7 @@ void snapshot_row(Session *s, const GhosttyRenderStateColors *colors,
     ghostty_render_state_row_cells_get(
         s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING, &has_styling);
     if (has_styling) {
-      GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
+      GhosttyStyle style = init_sized<GhosttyStyle>();
       ghostty_render_state_row_cells_get(
           s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
 
@@ -185,7 +194,7 @@ void snapshot_row(Session *s, const GhosttyRenderStateColors *colors,
   }
 
   GhosttyRenderStateRowSelection sel =
-      GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection);
+      init_sized<GhosttyRenderStateRowSelection>();
   if (ghostty_render_state_row_get(s->row_iter,
                                    GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION,
                                    &sel) == GHOSTTY_SUCCESS) {
@@ -615,7 +624,7 @@ static napi_value Render(napi_env env, napi_callback_info info) {
     return null_val;
   }
 
-  GhosttyRenderStateColors colors = GHOSTTY_INIT_SIZED(GhosttyRenderStateColors);
+  GhosttyRenderStateColors colors = init_sized<GhosttyRenderStateColors>();
   THROW_IF(env,
            ghostty_render_state_colors_get(s->render_state, &colors) !=
                GHOSTTY_SUCCESS,
