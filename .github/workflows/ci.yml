@@ -98,6 +98,13 @@ jobs:
           fi
           ls -la
 
+      - name: Inspect zig archive directives (diagnostics)
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
+          & $dumpbin /DIRECTIVES vendor/ghostty/zig-out/lib/ghostty-vt.lib | Select-String -Pattern "defaultlib|nodefault" | Sort-Object -Unique | Select-Object -First 20
+
       - name: Build native addon (VT core + stub platform layer)
         run: npm run build:native
 

@@ -22,7 +22,11 @@
         ["OS=='win'", {
           "sources": ["src/producer_stub.c"],
           "libraries": [
-            "<(module_root_dir)/../vendor/ghostty/zig-out/lib/ghostty-vt.lib"
+            "<(module_root_dir)/../vendor/ghostty/zig-out/lib/ghostty-vt.lib",
+            "ucrt.lib",
+            "msvcrt.lib",
+            "vcruntime.lib",
+            "legacy_stdio_definitions.lib"
           ]
         }],
         ["OS not in ['mac', 'win']", {
