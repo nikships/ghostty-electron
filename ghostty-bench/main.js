@@ -12,15 +12,15 @@
  * Flags: --repeat N (sustained mode, feeds the payload N times),
  *        --screenshot (dump final frame to results/).
  */
-if (process.platform !== 'darwin') {
-  console.error('This benchmark needs the native IOSurface producer (macOS-only for now).');
-  process.exit(1);
-}
 const { app, BrowserWindow, ipcMain, screen, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
 const addon = require(path.join(__dirname, '..', 'native', 'build', 'Release', 'ghostty_producer.node'));
+if (typeof addon.render !== 'function') {
+  console.error('No platform renderer in the addon on this OS.');
+  process.exit(1);
+}
 
 const PAYLOAD = path.join(__dirname, '..', 'payload.txt');
 if (!fs.existsSync(PAYLOAD)) {
@@ -79,7 +79,7 @@ app.whenReady().then(async () => {
       textureInfo: {
         codedSize: { width: frame.width, height: frame.height },
         pixelFormat: 'bgra',
-        handle: { ioSurface: frame.handle }
+        handle: process.platform === 'darwin' ? { ioSurface: frame.handle } : { ntHandle: frame.handle }
       }
     });
     pendingSendTimes.set(seq, t0);

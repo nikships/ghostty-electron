@@ -27,21 +27,23 @@
  *
  * Flags: --mb N (default 1024), --interrupt-ms N (default 4000), --keep-file
  */
-if (process.platform !== 'darwin') {
-  console.error('pty-bench needs the native IOSurface producer (macOS-only for now).');
-  process.exit(1);
-}
 const { app, BrowserWindow, ipcMain, screen, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const pty = require('node-pty');
 
 const addon = require(path.join(__dirname, '..', 'native', 'build', 'Release', 'ghostty_producer.node'));
+if (typeof addon.render !== 'function') {
+  console.error('No platform renderer in the addon on this OS.');
+  process.exit(1);
+}
 
 const COLS = 120;
 const ROWS = 30;
 const FONT_SIZE = 13;
-const SHELL = '/bin/zsh';
+const IS_WIN = process.platform === 'win32';
+const SHELL = IS_WIN ? 'powershell.exe' : '/bin/zsh';
+const HOME = process.env.HOME || process.env.USERPROFILE;
 
 const flagNum = (name, fallback) => {
   const i = process.argv.indexOf(name);
@@ -61,12 +63,24 @@ const READY_N = 7117;
 const DONE = `CAT_DONE_${DONE_N}`;
 const PONG = `PONG_${PONG_N}`;
 const READY = `SHELL_READY_${READY_N}`;
-const doneCmd = (file) => `cat ${file}; echo CAT_DONE_$((${DONE_N}))\r`;
-const pongCmd = `echo PONG_$((${PONG_N}))\r`;
-const readyCmd = `echo SHELL_READY_$((${READY_N}))\r`;
-// -f skips rc files: deterministic sub-100ms startup instead of seconds of
-// .zshrc plugins, and the same environment for both terminals.
-const SHELL_ARGS = ['-f'];
+// zsh builds the sentinel with $((…)) arithmetic, PowerShell with string
+// concatenation — either way the *typed* command line never contains the
+// exact sentinel, only its evaluation does.
+const doneCmd = (file) => IS_WIN
+  ? `cmd /c type "${file}"; echo ("CAT_DONE_" + ${DONE_N})\r`
+  : `cat ${file}; echo CAT_DONE_$((${DONE_N}))\r`;
+const pongCmd = IS_WIN
+  ? `echo ("PONG_" + ${PONG_N})\r`
+  : `echo PONG_$((${PONG_N}))\r`;
+const readyCmd = IS_WIN
+  ? `echo ("SHELL_READY_" + ${READY_N})\r`
+  : `echo SHELL_READY_$((${READY_N}))\r`;
+// -f / -NoProfile skip rc files: deterministic startup instead of seconds of
+// plugins, and the same environment for both terminals.
+const SHELL_ARGS = IS_WIN ? ['-NoProfile', '-NoLogo'] : ['-f'];
+// Clear the prompt line between latency samples: kill-whole-line on zsh,
+// RevertLine (Escape) on PSReadLine.
+const KILL_LINE = IS_WIN ? '\x1b' : '\x15';
 
 // Rate-limited load for the latency probe: ~2000 lines/s ("build output"),
 // slow enough that an echoed keystroke persists on screen. At unthrottled
@@ -165,7 +179,9 @@ function pipeCeiling(file) {
   return new Promise((resolve) => {
     const t0 = now();
     let bytes = 0;
-    const p = pty.spawn('/bin/cat', [file], { name: 'xterm-256color', cols: COLS, rows: ROWS });
+    const p = IS_WIN
+      ? pty.spawn('cmd.exe', ['/c', 'type', file], { name: 'xterm-256color', cols: COLS, rows: ROWS })
+      : pty.spawn('/bin/cat', [file], { name: 'xterm-256color', cols: COLS, rows: ROWS });
     p.onData((d) => { bytes += d.length; });
     p.onExit(() => {
       const ms = now() - t0;
@@ -199,7 +215,7 @@ async function ghosttyRun(file, { interrupt, latency, soak }) {
 
   const shell = pty.spawn(SHELL, SHELL_ARGS, {
     name: 'xterm-256color', cols: COLS, rows: ROWS,
-    cwd: process.env.HOME, env: process.env
+    cwd: HOME, env: process.env
   });
   let chunks = 0, chunkBytes = 0, doneArrivedAt = 0;
   shell.onData((d) => {
@@ -231,7 +247,7 @@ async function ghosttyRun(file, { interrupt, latency, soak }) {
         textureInfo: {
           codedSize: { width: frame.width, height: frame.height },
           pixelFormat: 'bgra',
-          handle: { ioSurface: frame.handle }
+          handle: process.platform === 'darwin' ? { ioSurface: frame.handle } : { ntHandle: frame.handle }
         }
       });
       await sharedTexture.sendSharedTexture(
@@ -329,7 +345,7 @@ async function ghosttyRun(file, { interrupt, latency, soak }) {
     const idle = [];
     for (let i = 0; i < SAMPLES; i++) {
       idle.push(await measure(`zq${i}xj`));
-      shell.write('\x15'); // kill-line: clean the prompt between samples
+      shell.write(KILL_LINE); // clean the prompt between samples
       await sleep(150);
     }
     shell.write(busyCmd);
@@ -394,7 +410,7 @@ async function xtermRun(file, { interrupt, latency, soak }) {
 
   const shell = pty.spawn(SHELL, SHELL_ARGS, {
     name: 'xterm-256color', cols: COLS, rows: ROWS,
-    cwd: process.env.HOME, env: process.env
+    cwd: HOME, env: process.env
   });
 
   // VS Code-style flow control + batching: PTY chunks are tiny, and one IPC
@@ -482,7 +498,7 @@ async function xtermRun(file, { interrupt, latency, soak }) {
     const idle = [];
     for (let i = 0; i < SAMPLES; i++) {
       idle.push(await measure(`zq${i}xj`));
-      shell.write('\x15');
+      shell.write(KILL_LINE);
       await sleep(150);
     }
     shell.write(busyCmd);

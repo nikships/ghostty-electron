@@ -20,14 +20,18 @@
           }
         }],
         ["OS=='win'", {
-          "sources": ["src/producer_stub.c"],
+          "sources": ["src/producer_win.cc"],
           "defines": ["GHOSTTY_STATIC"],
           "libraries": [
             "<(module_root_dir)/../vendor/ghostty/zig-out/lib/ghostty-vt-static.lib",
             "libcmt.lib",
             "libucrt.lib",
             "libvcruntime.lib",
-            "ntdll.lib"
+            "ntdll.lib",
+            "d3d11.lib",
+            "dxgi.lib",
+            "d2d1.lib",
+            "dwrite.lib"
           ]
         }],
         ["OS not in ['mac', 'win']", {

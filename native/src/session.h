@@ -77,6 +77,10 @@ typedef struct {
   CGColorSpaceRef colorspace;
   CTFontRef fonts[FONT_COUNT];
   CGGlyph ascii_glyphs[FONT_COUNT][95];  // glyph cache for 0x20..0x7E
+#elif defined(_WIN32)
+  // Opaque C++ state (D3D11/D2D/DWrite COM objects) owned by producer_win.cc.
+  void *win;
+  int surface_index;
 #endif
 } Session;
 

@@ -9,29 +9,29 @@
  *   --smoke  echo a marker through both PTYs, verify both grids show it,
  *            write results/demo-smoke.json (+ screenshots) and exit.
  */
-if (process.platform !== 'darwin') {
-  console.error('The demo needs the native IOSurface producer (macOS-only for now).');
-  process.exit(1);
-}
 const { app, BrowserWindow, clipboard, ipcMain, screen, shell, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const pty = require('node-pty');
 
 const addon = require(path.join(__dirname, '..', 'native', 'build', 'Release', 'ghostty_producer.node'));
+if (typeof addon.render !== 'function') {
+  console.error('No platform renderer in the addon on this OS.');
+  process.exit(1);
+}
 
 const COLS = 120;
 const ROWS = 30;
 const FONT_SIZE = 13;
 const SMOKE = process.argv.includes('--smoke');
-const SHELL = process.env.SHELL || '/bin/zsh';
+const SHELL = process.platform === 'win32' ? 'powershell.exe' : (process.env.SHELL || '/bin/zsh');
 
 function spawnShell(cols, rows) {
   return pty.spawn(SHELL, [], {
     name: 'xterm-256color',
     cols,
     rows,
-    cwd: process.env.HOME,
+    cwd: process.env.HOME || process.env.USERPROFILE,
     env: process.env
   });
 }
@@ -103,7 +103,7 @@ app.whenReady().then(async () => {
         textureInfo: {
           codedSize: { width: frame.width, height: frame.height },
           pixelFormat: 'bgra',
-          handle: { ioSurface: frame.handle }
+          handle: process.platform === 'darwin' ? { ioSurface: frame.handle } : { ntHandle: frame.handle }
         }
       });
       await sharedTexture.sendSharedTexture(

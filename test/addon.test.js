@@ -14,9 +14,10 @@ function makeTerm(cols = 80, rows = 24, fontSize = 13, scale = 2) {
   return addon.create(cols, rows, fontSize, scale);
 }
 
-// Rendering (render/readPixels) exists only in the macOS platform layer;
-// VT state, text readout, key encoding and selection are cross-platform.
-const RENDER = process.platform === 'darwin' ? {} : { skip: 'renderer is macOS-only' };
+// Rendering exists where a platform producer is built (macOS IOSurface,
+// Windows D3D11); VT state, text readout, key encoding and selection are
+// cross-platform everywhere.
+const RENDER = typeof addon.render === 'function' ? {} : { skip: 'no platform renderer' };
 
 function write(t, s) {
   addon.write(t.session, Buffer.from(s, 'utf8'));
@@ -164,7 +165,7 @@ test('resize changes grid and surface dimensions', () => {
   assert.strictEqual(lines.length, 30);
   assert.strictEqual(lines[0], 'before resize', 'content survives resize');
 
-  if (process.platform === 'darwin') {
+  if (typeof addon.render === 'function') {
     const f = addon.render(t.session);
     assert.ok(f, 'resize forces a present');
     assert.strictEqual(f.width, dims.width);
