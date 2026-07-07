@@ -93,29 +93,72 @@ before your keystroke's effect appears), at ~2× less CPU and ~7× less memory
 growth. This is the honest headline: *architecture buys you latency under
 load more than it buys you raw completion time.*
 
+### Input latency — `npm run bench:pty -- --latency` (macOS)
+
+Keystroke → echo visible on screen, at an idle prompt and under a
+2 000 lines/s "build output" load (under an *unthrottled* flood the screen
+scrolls millions of lines/s and a typed echo never lands on a presented
+frame in any terminal — unmeasurable by definition):
+
+| terminal | idle p50 | busy p50 |
+|---|---|---|
+| xterm.js | 32.5 ms | 36.1 ms |
+| ghostty | **17 ms** | **11.6 ms** |
+
+### Leak soak — `npm run bench:pty -- --soak-min 10`
+
+Ten minutes of continuous full-speed output per terminal, memory sampled
+every 2 s, least-squares slope after warm-up must stay under 10 MB/min:
+ghostty consumed **28.2 GB** (slope 0.29 MB/min), xterm 15.2 GB (slope 0) —
+both flat, no leaks. CI runs a 2-minute version on every push.
+
+### vs stock Ghostty.app — `npm run bench:stock` (macOS)
+
+How much does Electron cost? Same 256 MiB, same write-side finish line
+(`cat` completes; stock apps' screens can't be read programmatically):
+
+| | stock Ghostty (native) | ghostty-in-Electron | xterm-in-Electron |
+|---|---|---|---|
+| cat 256 MiB | **3.5 s** | 5.6 s | 11.3 s |
+
+Electron + node-pty's ~1 KB chunking costs the libghostty pipeline ~1.6×
+vs the fully native app; xterm.js doubles it again.
+
+### Does the CPU rasterizer need a GPU replacement? — `npm run bench:render`
+
+Worst case by construction: 4K-equivalent surface, every cell changing
+every frame (zero dirty-row savings). Result: **325 full redraws/s
+(3.07 ms avg)** against the 8.3 ms 120 Hz budget — the CPU rasterizer holds
+120 Hz at 4K full damage with ~2.7× headroom. Measured evidence that a
+Metal/GPU pass isn't needed at current targets.
+
 ### Feel it yourself — `npm run demo` (macOS)
 
-Two windows, each a real interactive shell: left xterm.js, right ghostty
-(with mouse selection, Cmd+C/Cmd+V, scrollback, mode-aware arrow keys for
-vim/less, stats overlays). Run `time cat payload.txt`, `find /`, or hold a
-key in vim, side by side.
+Two windows, each a real interactive shell: left xterm.js, right ghostty —
+with mouse selection, double-click word selection, Cmd+C/Cmd+V, Cmd+F
+search over scrollback, Cmd+click to open URLs, IME composition, cursor
+blink, wheel scrollback, and mode-aware arrow keys for vim/less. Run
+`time cat payload.txt`, `find /`, or hold a key in vim, side by side.
 
 ## Platform matrix
 
+All three OSes run in CI on every push:
+
 | | macOS (arm64) | Windows (x64) | Linux |
 |---|---|---|---|
-| libghostty-vt build (zig) | ✅ | ✅ | untested |
-| parser benchmark + conformance/fuzz tests | ✅ | ✅ | untested |
-| xterm.js baseline benchmark | ✅ | ✅ | untested |
-| native presentation (sharedTexture producer) | ✅ IOSurface + CoreText | ⬜ needs a D3D11 + DirectWrite port | ⬜ needs dmabuf |
-| PTY race + interactive demo | ✅ | ⬜ (ConPTY + producer port) | ⬜ |
+| libghostty-vt build (zig) | ✅ | ✅ (msvc ABI) | ✅ |
+| parser benchmark + conformance/fuzz tests | ✅ | ✅ | ✅ |
+| xterm.js baseline benchmark | ✅ | ✅ | ✅ (xvfb + SwiftShader) |
+| native presentation producer | ✅ IOSurface + CoreText | ✅ D3D11 + DirectWrite — pixel + render-equivalence tests pass on CI (WARP) | ⬜ needs dmabuf |
+| in-Electron sharedTexture GUI | ✅ | 🟡 implemented; validation on GPU-less runners in progress | ⬜ |
+| PTY race + latency + soak | ✅ | 🟡 runs, but **ConPTY caps the pipe at ~0.1 MB/s** on runners — Windows PTY numbers measure ConPTY, not the terminals | ⬜ |
 
-The addon is split accordingly: `native/src/vt.c` (session, parsing, text
-readout, key encoding, selection) builds everywhere; `producer_mac.m` is the
-macOS presentation layer; `producer_stub.c` covers other platforms until
-their producers exist. Electron's `sharedTexture` API takes a D3D11
-`ntHandle` on Windows, so the port is "same architecture, different platform
-APIs" — not a redesign.
+The addon split: `native/src/vt.c` (session, parsing, text readout, key
+encoding, selection, search) builds everywhere; `producer_mac.m` (CoreText →
+IOSurface) and `producer_win.cc` (DirectWrite/D2D → shared D3D11 textures,
+hardware with WARP fallback) are the presentation layers; `producer_stub.c`
+covers Linux until a dmabuf producer exists. The same pixel-level and
+incremental-vs-full-redraw equivalence tests run against both renderers.
 
 ## Fairness engineering
 
@@ -162,10 +205,9 @@ Four test layers (`npm test` + `npm run test:integration`, all in CI):
    streams diffed row-by-row against `@xterm/headless` (the exact emulator
    VS Code ships), including the full 1 MiB benchmark payload. The speed
    comparison only counts because both engines demonstrably do the same
-   work. The fuzzer found one genuine divergence — **DECRC after a DECSTBM
-   scroll** (ghostty restores the absolute saved row, xterm.js the
-   scroll-adjusted one) — which is pinned in a dedicated test so a behavior
-   change in either engine surfaces.
+   work. The fuzzer found two genuine emulator divergences (DECRC after a
+   DECSTBM scroll; DECOM homing after DECSTBM) — both pinned as tests and
+   written up with minimal repros in `docs/upstream-divergences.md`.
 4. **Electron integration** — the real apps run end-to-end on CI: both
    benchmarks produce sane per-stage stats and screenshots, the PTY race
    completes at 8 MiB with valid metrics, and the demo round-trips a live
@@ -175,9 +217,10 @@ CI runs the full suite on macOS (Apple Silicon runner, including the
 Electron GUI apps and benchmarks — numbers in each run's job summary) and
 the portable subset plus xterm baseline on Windows.
 
-Worth adding as follow-ups: input-to-glass latency probes with an external
-clock, long-run soak tests for leaks (the CPU/mem sampling is a start), a
-Linux job, and tracking benchmark history across commits.
+CI also runs the input-latency probe, a 2-minute soak, the render-stress
+benchmark, and compares every metric against the previous main run in the
+job summary (drift >20% gets flagged). See `docs/npm-package-plan.md` for
+the plan to extract all of this into a reusable `electron-ghostty` package.
 
 ## Run it
 
