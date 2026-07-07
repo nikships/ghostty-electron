@@ -45,6 +45,17 @@ function percentile(sorted, p) {
   return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
 }
 
+// Watchdog: a consumer that never acks (or an import failure swallowed by
+// a promise) would otherwise hang the benchmark forever.
+setTimeout(() => {
+  console.error('watchdog: benchmark did not complete within 180s');
+  app.exit(1);
+}, 180_000);
+process.on('unhandledRejection', (err) => {
+  console.error('unhandled rejection:', err);
+  app.exit(1);
+});
+
 app.whenReady().then(async () => {
   const scale = screen.getPrimaryDisplay().scaleFactor;
   const term = addon.create(COLS, ROWS, FONT_SIZE, scale);

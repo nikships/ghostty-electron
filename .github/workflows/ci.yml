@@ -208,13 +208,21 @@ jobs:
 
       # Experimental until proven on the GPU-less runner: sharedTexture
       # import of D3D11 NT handles under WARP inside Chromium's GPU process.
+      # NOTE: continue-on-error steps report conclusion=success even when the
+      # outcome failed — read the log, not the checkmark.
       - name: ghostty benchmark (Electron sharedTexture, experimental)
         continue-on-error: true
-        run: npx electron ghostty-bench/main.js --screenshot
+        env:
+          ELECTRON_ENABLE_LOGGING: "1"
+        run: npx electron ghostty-bench/main.js --screenshot --enable-logging
 
+      # ConPTY itself caps PTY throughput at ~0.1 MB/s on runners (measured
+      # pipe ceiling) — this race exercises correctness there, not speed.
       - name: PTY race smoke (ConPTY + PowerShell, experimental)
         continue-on-error: true
-        run: npx electron pty-bench/main.js --mb 8 --interrupt-ms 500
+        env:
+          ELECTRON_ENABLE_LOGGING: "1"
+        run: npx electron pty-bench/main.js --mb 2 --interrupt-ms 500
 
       - name: Compare with previous main run
         if: always()
