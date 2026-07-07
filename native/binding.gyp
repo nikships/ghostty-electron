@@ -21,6 +21,7 @@
         }],
         ["OS=='win'", {
           "sources": ["src/producer_stub.c"],
+          "defines": ["GHOSTTY_STATIC"],
           "libraries": [
             "<(module_root_dir)/../vendor/ghostty/zig-out/lib/ghostty-vt-static.lib",
             "libcmt.lib",
