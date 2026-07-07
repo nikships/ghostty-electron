@@ -15,7 +15,8 @@
     "bench:pty": "electron pty-bench/main.js",
     "demo": "electron demo/main.js",
     "test": "node --test test/addon.test.js test/conformance.test.js test/fuzz.test.js",
-    "test:integration": "node --test test/integration.test.js"
+    "test:integration": "node --test test/integration.test.js",
+    "bench:stock": "node scripts/bench-stock.js"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.1.0",

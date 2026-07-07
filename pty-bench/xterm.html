@@ -34,10 +34,11 @@
     let scanTimer = setInterval(() => { lastScan = 0; scanForMarker(); }, scanIntervalMs);
 
     let debugScans = 0;
+    let watchDepth = 0; // 0 = viewport endsWith; >0 = last N buffer lines, includes
     function scanForMarker() {
       if (!watchMarker || !term) return;
       const t = performance.now();
-      if (t - lastScan < 50) return;
+      if (t - lastScan < scanIntervalMs) return;
       lastScan = t;
       const buf = term.buffer.active;
       if (++debugScans % 40 === 0) {
@@ -47,6 +48,24 @@
           tail.push(l ? l.translateToString(true) : '<null>');
         }
         ipcRenderer.send('x-debug', { viewportY: buf.viewportY, baseY: buf.baseY, tail });
+      }
+      if (watchDepth > 0) {
+        // Deep scan for the latency probe: under a flood the echo scrolls out
+        // of the viewport within milliseconds — look at recent history too.
+        const total = buf.baseY + term.rows;
+        for (let i = Math.max(0, total - watchDepth); i < total; i++) {
+          const line = buf.getLine(i);
+          if (line && line.translateToString(true).includes(watchMarker)) {
+            const marker = watchMarker;
+            watchMarker = null;
+            let sent = false;
+            const report = () => { if (!sent) { sent = true; ipcRenderer.send('x-found', marker); } };
+            requestAnimationFrame(() => requestAnimationFrame(report));
+            setTimeout(report, 100);
+            return;
+          }
+        }
+        return;
       }
       for (let i = 0; i < term.rows; i++) {
         const line = buf.getLine(buf.viewportY + i);
@@ -91,8 +110,9 @@
       });
     });
 
-    ipcRenderer.on('x-watch', (event, { marker, pollMs }) => {
+    ipcRenderer.on('x-watch', (event, { marker, pollMs, depth }) => {
       watchMarker = marker;
+      watchDepth = depth || 0;
       lastScan = 0;
       if (pollMs && pollMs !== scanIntervalMs) {
         scanIntervalMs = pollMs;

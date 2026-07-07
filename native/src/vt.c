@@ -495,6 +495,73 @@ static napi_value GetSelectionText(napi_env env, napi_callback_info info) {
   return result;
 }
 
+/** getRecentText(session, rows) → string — the last N rows of screen space
+ *  (scrollback + active), via the formatter with an ad-hoc selection range.
+ *  Never touches the terminal's user-visible selection state. Used by the
+ *  latency probe: under a flood, an echoed keystroke scrolls out of the
+ *  viewport within milliseconds, so detection must look at recent history. */
+static napi_value GetRecentText(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 2, "getRecentText(session, rows)");
+
+  Session *s = gxb_get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  uint32_t want = 0;
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[1], &want));
+
+  napi_value null_val;
+  NAPI_CALL(env, napi_get_null(env, &null_val));
+
+  GhosttyTerminalScrollbar bar;
+  if (ghostty_terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_SCROLLBAR,
+                           &bar) != GHOSTTY_SUCCESS || bar.total == 0)
+    return null_val;
+
+  uint64_t last = bar.total - 1;
+  uint64_t first = want >= bar.total ? 0 : bar.total - want;
+
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyPoint p0 = {
+      .tag = GHOSTTY_POINT_TAG_SCREEN,
+      .value = {.coordinate = {.x = 0, .y = (uint32_t)first}},
+  };
+  GhosttyPoint p1 = {
+      .tag = GHOSTTY_POINT_TAG_SCREEN,
+      .value = {.coordinate = {.x = (uint16_t)(s->cols - 1),
+                               .y = (uint32_t)last}},
+  };
+  if (ghostty_terminal_grid_ref(s->terminal, p0, &sel.start) !=
+          GHOSTTY_SUCCESS ||
+      ghostty_terminal_grid_ref(s->terminal, p1, &sel.end) != GHOSTTY_SUCCESS)
+    return null_val;
+
+  GhosttyFormatterTerminalOptions opts =
+      GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
+  opts.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  opts.trim = true;
+  opts.selection = &sel;
+
+  GhosttyFormatter formatter;
+  if (ghostty_formatter_terminal_new(NULL, &formatter, s->terminal, opts) !=
+      GHOSTTY_SUCCESS)
+    return null_val;
+
+  uint8_t *buf = NULL;
+  size_t len = 0;
+  napi_value result = null_val;
+  if (ghostty_formatter_format_alloc(formatter, NULL, &buf, &len) ==
+          GHOSTTY_SUCCESS &&
+      buf) {
+    napi_create_string_utf8(env, (const char *)buf, len, &result);
+    ghostty_free(NULL, buf, len);
+  }
+  ghostty_formatter_free(formatter);
+  return result;
+}
+
 /* ── encodeKey ────────────────────────────────────────────────────────── */
 
 typedef struct {
@@ -645,6 +712,7 @@ NAPI_MODULE_INIT() {
       {"setSelection", NULL, SetSelection, NULL, NULL, NULL, napi_default, NULL},
       {"clearSelection", NULL, ClearSelection, NULL, NULL, NULL, napi_default, NULL},
       {"getSelectionText", NULL, GetSelectionText, NULL, NULL, NULL, napi_default, NULL},
+      {"getRecentText", NULL, GetRecentText, NULL, NULL, NULL, napi_default, NULL},
   };
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
   gxb_platform_register(env, exports);  // render/readPixels on macOS

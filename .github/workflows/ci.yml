@@ -60,6 +60,53 @@ jobs:
           path: results/
           if-no-files-found: ignore
 
+  linux:
+    name: Linux (parser + xterm baseline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build libghostty-vt
+        run: npm run setup:ghostty
+
+      - name: Build native addon (VT core + stub platform layer)
+        run: npm run build:native
+
+      - name: Generate payload
+        run: npm run payload
+
+      - name: Unit + conformance + fuzz tests (renderer tests skip)
+        run: npm test
+
+      - name: Parse benchmark (10 MiB)
+        run: npm run bench:parse -- --mb 10 --runs 3
+
+      - name: xterm baseline benchmark (Electron under xvfb)
+        run: xvfb-run --auto-servernum npx electron xterm-bench/main.js --no-sandbox
+
+      - name: Job summary
+        if: always()
+        run: node scripts/ci-summary.js >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-linux
+          path: results/
+          if-no-files-found: ignore
+
   windows:
     name: Windows (parser + xterm baseline)
     # windows-latest now maps to Windows 2025 + VS2026 ("Visual Studio 18"),

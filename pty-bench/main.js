@@ -49,6 +49,8 @@ const flagNum = (name, fallback) => {
 };
 const SIZE_MB = flagNum('--mb', 1024);
 const INTERRUPT_MS = flagNum('--interrupt-ms', 4000);
+const SAMPLES = flagNum('--samples', 8);
+const LATENCY = process.argv.includes('--latency');
 
 // Sentinels: built with $((…)) so the *typed command* echoed to the screen
 // never matches the exact output line we search for.
@@ -65,8 +67,17 @@ const readyCmd = `echo SHELL_READY_$((${READY_N}))\r`;
 // .zshrc plugins, and the same environment for both terminals.
 const SHELL_ARGS = ['-f'];
 
+// Rate-limited load for the latency probe: ~2000 lines/s ("build output"),
+// slow enough that an echoed keystroke persists on screen. At unthrottled
+// cat rates the screen scrolls millions of lines/s and a typed echo never
+// lands on a presented frame in ANY terminal — unmeasurable by definition.
+const busyCmd =
+  `node -e "const l='x'.repeat(60);let n=0;setInterval(()=>{for(let i=0;i<100;i++)console.log('busy'+(n++)+' '+l)},50)"\r`;
+
 const now = () => performance.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const percentile = (sorted, p) =>
+  sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] : 0;
 
 /* ── payload ─────────────────────────────────────────────────────────── */
 
@@ -147,7 +158,7 @@ function pipeCeiling(file) {
 
 /* ── ghostty runner ──────────────────────────────────────────────────── */
 
-async function ghosttyRun(file, { interrupt }) {
+async function ghosttyRun(file, { interrupt, latency }) {
   for (const ch of ['renderer-ready', 'frame-presented']) ipcMain.removeAllListeners(ch);
 
   const scale = screen.getPrimaryDisplay().scaleFactor;
@@ -158,7 +169,7 @@ async function ghosttyRun(file, { interrupt }) {
   const win = new BrowserWindow({
     width: cssW + 20,
     height: cssH + 60,
-    title: `ghostty pty-bench${interrupt ? ' (interrupt probe)' : ''}`,
+    title: `ghostty pty-bench${interrupt ? ' (interrupt probe)' : latency ? ' (latency probe)' : ''}`,
     webPreferences: {
       sandbox: true,
       // Never let Chromium throttle rAF/timers when occluded: frame acks
@@ -172,10 +183,11 @@ async function ghosttyRun(file, { interrupt }) {
     name: 'xterm-256color', cols: COLS, rows: ROWS,
     cwd: process.env.HOME, env: process.env
   });
-  let chunks = 0, chunkBytes = 0;
+  let chunks = 0, chunkBytes = 0, doneArrivedAt = 0;
   shell.onData((d) => {
     chunks++;
     chunkBytes += d.length;
+    if (!doneArrivedAt && d.includes(DONE)) doneArrivedAt = now();
     try { addon.write(term.session, Buffer.from(d, 'utf8')); } catch {}
   });
   const gDebugTimer = process.env.PTYBENCH_DEBUG
@@ -252,7 +264,7 @@ async function ghosttyRun(file, { interrupt }) {
   const sampler = startMetricsSampler();
   const result = {};
   const t0 = now();
-  shell.write(doneCmd(file));
+  if (!latency) shell.write(doneCmd(file));
 
   if (interrupt) {
     await sleep(INTERRUPT_MS);
@@ -262,9 +274,66 @@ async function ghosttyRun(file, { interrupt }) {
     shell.write(pongCmd);
     await visible(PONG, 20);
     result.interruptMs = +(now() - tIntr).toFixed(0);
+  } else if (latency) {
+    // Keystroke→visible-echo latency, sampled at idle and mid-flood. The
+    // echo scrolls out of the viewport within milliseconds under load, so
+    // detection scans recent screen history (viewport + tail of scrollback).
+    const measure = async (marker) => {
+      const t = now();
+      shell.write(marker);
+      for (;;) {
+        const recent = addon.getRecentText(term.session, 300);
+        if (recent && recent.includes(marker)) break;
+        await sleep(3);
+      }
+      // Confirm a frame produced *after* detection was presented — the same
+      // finish line as xterm's double-rAF report.
+      const seqAtDetect = seq;
+      const t2 = now();
+      while (!(seq > seqAtDetect && maxAcked >= seqAtDetect + 1) &&
+             now() - t2 < 300) await sleep(2);
+      return now() - t;
+    };
+    const floodActive = () => {
+      const before = chunkBytes;
+      return sleep(30).then(() => chunkBytes > before);
+    };
+    const idle = [];
+    for (let i = 0; i < SAMPLES; i++) {
+      idle.push(await measure(`zq${i}xj`));
+      shell.write('\x15'); // kill-line: clean the prompt between samples
+      await sleep(150);
+    }
+    shell.write(busyCmd);
+    await sleep(1500); // let the load reach steady state
+    const flood = [];
+    let dropped = 0;
+    for (let i = 0; i < SAMPLES; i++) {
+      const sample = await measure(`fq${i}xj`);
+      const active = await floodActive();
+      if (process.env.PTYBENCH_DEBUG)
+        console.log(`  [ghostty] flood sample ${i}: ${sample.toFixed(1)}ms active=${active}`);
+      // Discard samples where the flood ended mid-measurement (the echo then
+      // measures prompt behavior, not under-load behavior).
+      if (active) flood.push(sample);
+      else { dropped++; break; }
+      await sleep(350);
+    }
+    shell.write('\x03');
+    result.droppedFloodSamples = dropped;
+    idle.sort((a, b) => a - b);
+    flood.sort((a, b) => a - b);
+    result.idleP50Ms = +percentile(idle, 0.5).toFixed(1);
+    result.idleP95Ms = +percentile(idle, 0.95).toFixed(1);
+    result.floodP50Ms = +percentile(flood, 0.5).toFixed(1);
+    result.floodP95Ms = +percentile(flood, 0.95).toFixed(1);
+    result.samples = SAMPLES;
   } else {
     await visible(DONE, 50);
     result.catMs = +(now() - t0).toFixed(0);
+    // Write-side finish line (cat done, sentinel reached the pty reader) —
+    // comparable with stock terminals whose screens we can't read.
+    result.catExitMs = +(doneArrivedAt - t0).toFixed(0);
     result.ptyChunks = chunks;
     result.avgChunkBytes = Math.round(chunkBytes / Math.max(1, chunks));
   }
@@ -280,13 +349,13 @@ async function ghosttyRun(file, { interrupt }) {
 
 /* ── xterm runner ────────────────────────────────────────────────────── */
 
-async function xtermRun(file, { interrupt }) {
+async function xtermRun(file, { interrupt, latency }) {
   for (const ch of ['x-ready', 'x-input', 'x-acked', 'x-found']) ipcMain.removeAllListeners(ch);
 
   const win = new BrowserWindow({
     width: 1100,
     height: 620,
-    title: `xterm pty-bench${interrupt ? ' (interrupt probe)' : ''}`,
+    title: `xterm pty-bench${interrupt ? ' (interrupt probe)' : latency ? ' (latency probe)' : ''}`,
     // backgroundThrottling: an occluded window otherwise gets its rAF
     // suspended and setTimeout clamped — it silently poisoned an overnight
     // run with ~18 minutes of "waiting for a frame". VS Code disables it too.
@@ -302,11 +371,12 @@ async function xtermRun(file, { interrupt }) {
   // message per chunk collapses throughput; batch every 4 ms. Pause the PTY
   // when the renderer is >32 MiB behind so a 1 GiB flood can't queue
   // unbounded strings.
-  let sentBytes = 0, ackedBytes = 0, paused = false;
+  let sentBytes = 0, ackedBytes = 0, paused = false, xDoneArrivedAt = 0;
   const HIGH = 32 * 1024 * 1024, LOW = 8 * 1024 * 1024;
   let batch = [];
   shell.onData((d) => {
     sentBytes += d.length;
+    if (!xDoneArrivedAt && d.includes(DONE)) xDoneArrivedAt = now();
     batch.push(d);
     if (!paused && sentBytes - ackedBytes > HIGH) { paused = true; shell.pause(); }
   });
@@ -332,10 +402,15 @@ async function xtermRun(file, { interrupt }) {
   await ready;
   win.webContents.send('x-config', { cols: COLS, rows: ROWS, fontSize: FONT_SIZE });
 
-  function visible(marker, pollMs = 50) {
+  function visible(marker, pollMs = 50, depth = 0) {
     return new Promise((resolve) => {
-      ipcMain.on('x-found', (e, m) => { if (m === marker) resolve(now()); });
-      win.webContents.send('x-watch', { marker, pollMs });
+      const handler = (e, m) => {
+        if (m !== marker) return;
+        ipcMain.removeListener('x-found', handler);
+        resolve(now());
+      };
+      ipcMain.on('x-found', handler);
+      win.webContents.send('x-watch', { marker, pollMs, depth });
     });
   }
 
@@ -353,7 +428,46 @@ async function xtermRun(file, { interrupt }) {
   const result = {};
   const t0 = now();
 
-  if (interrupt) {
+  if (latency) {
+    // Keystroke→visible-echo latency (see the ghostty runner for the model);
+    // detection deep-scans the tail of the renderer's buffer.
+    const measure = async (marker) => {
+      const found = visible(marker, 10, 300);
+      const t = now();
+      shell.write(marker);
+      await found;
+      return now() - t;
+    };
+    const floodActive = () => {
+      const before = sentBytes;
+      return sleep(30).then(() => sentBytes > before);
+    };
+    const idle = [];
+    for (let i = 0; i < SAMPLES; i++) {
+      idle.push(await measure(`zq${i}xj`));
+      shell.write('\x15');
+      await sleep(150);
+    }
+    shell.write(busyCmd);
+    await sleep(1500); // let the load reach steady state
+    const flood = [];
+    let dropped = 0;
+    for (let i = 0; i < SAMPLES; i++) {
+      const sample = await measure(`fq${i}xj`);
+      if (await floodActive()) flood.push(sample);
+      else { dropped++; break; }
+      await sleep(350);
+    }
+    shell.write('\x03');
+    result.droppedFloodSamples = dropped;
+    idle.sort((a, b) => a - b);
+    flood.sort((a, b) => a - b);
+    result.idleP50Ms = +percentile(idle, 0.5).toFixed(1);
+    result.idleP95Ms = +percentile(idle, 0.95).toFixed(1);
+    result.floodP50Ms = +percentile(flood, 0.5).toFixed(1);
+    result.floodP95Ms = +percentile(flood, 0.95).toFixed(1);
+    result.samples = SAMPLES;
+  } else if (interrupt) {
     const found = visible(PONG, 20);
     shell.write(doneCmd(file));
     await sleep(INTERRUPT_MS);
@@ -367,6 +481,7 @@ async function xtermRun(file, { interrupt }) {
     shell.write(doneCmd(file));
     await found;
     result.catMs = +(now() - t0).toFixed(0);
+    result.catExitMs = +(xDoneArrivedAt - t0).toFixed(0);
   }
 
   Object.assign(result, sampler.stop());
@@ -386,6 +501,42 @@ app.whenReady().then(async () => {
   try {
     const file = ensurePayload();
     const mb = fs.statSync(file).size / (1024 * 1024);
+
+    if (LATENCY) {
+      console.log(`\nghostty: latency probe (${SAMPLES} samples idle + mid-flood)...`);
+      const g = await ghosttyRun(file, { latency: true });
+      console.log(`  idle p50 ${g.idleP50Ms} ms · flood p50 ${g.floodP50Ms} ms`);
+      console.log(`xterm: latency probe...`);
+      const x = await xtermRun(file, { latency: true });
+      console.log(`  idle p50 ${x.idleP50Ms} ms · flood p50 ${x.floodP50Ms} ms`);
+
+      const out = {
+        mode: 'latency',
+        sizeMB: mb,
+        samples: SAMPLES,
+        ghostty: g,
+        xterm: x,
+        electronVersion: process.versions.electron,
+        platform: process.platform,
+        arch: process.arch
+      };
+      const pad = (s, n) => String(s).padStart(n);
+      console.log('\n' + '═'.repeat(78));
+      console.log(`  INPUT LATENCY: keystroke → echo visible on screen (${SAMPLES} samples)`);
+      console.log('═'.repeat(78));
+      console.log(`  ${'terminal'.padEnd(10)} ${pad('idle p50', 10)} ${pad('idle p95', 10)} ${pad('flood p50', 11)} ${pad('flood p95', 11)}`);
+      console.log('  ' + '─'.repeat(74));
+      console.log(`  ${'xterm'.padEnd(10)} ${pad(x.idleP50Ms, 10)} ${pad(x.idleP95Ms, 10)} ${pad(x.floodP50Ms, 11)} ${pad(x.floodP95Ms, 11)}`);
+      console.log(`  ${'ghostty'.padEnd(10)} ${pad(g.idleP50Ms, 10)} ${pad(g.idleP95Ms, 10)} ${pad(g.floodP50Ms, 11)} ${pad(g.floodP95Ms, 11)}`);
+      console.log('═'.repeat(78));
+
+      const resultsDir = path.join(__dirname, '..', 'results');
+      fs.mkdirSync(resultsDir, { recursive: true });
+      fs.writeFileSync(path.join(resultsDir, 'pty-latency.json'), JSON.stringify(out, null, 2));
+      if (!process.argv.includes('--keep-file') && SIZE_MB >= 256) fs.unlinkSync(file);
+      app.exit(0);
+      return;
+    }
 
     console.log(`\npipe ceiling (node-pty → no-op consumer)...`);
     const pipe = await pipeCeiling(file);

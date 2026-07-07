@@ -17,61 +17,7 @@ const ROWS = 24;
 const CASES = 40;
 const TOKENS_PER_CASE = 120;
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6D2B79F5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
-function makeStream(rnd) {
-  const int = (n) => Math.floor(rnd() * n);
-  const pick = (arr) => arr[int(arr.length)];
-  const generators = [
-    // plain text runs
-    () => Array.from({ length: 1 + int(20) }, () => pick('abcdefgh XYZ0123._-'.split(''))).join(''),
-    () => '\r\n',
-    () => '\r',
-    () => '\n',
-    () => '\t',
-    // absolute + relative cursor movement
-    () => `\x1b[${1 + int(ROWS)};${1 + int(COLS)}H`,
-    () => `\x1b[${1 + int(5)}${pick(['A', 'B', 'C', 'D'])}`,
-    // SGR
-    () => `\x1b[${pick(['0', '1', '4', '7', '22', '24', '27'])}m`,
-    () => `\x1b[${30 + int(8)}m`,
-    () => `\x1b[${40 + int(8)}m`,
-    () => `\x1b[38;5;${int(256)}m`,
-    () => `\x1b[38;2;${int(256)};${int(256)};${int(256)}m`,
-    // erase
-    () => `\x1b[${int(3)}J`,
-    () => `\x1b[${int(3)}K`,
-    // scroll region set/reset and explicit scroll
-    () => {
-      const top = 1 + int(ROWS - 2);
-      return `\x1b[${top};${top + 1 + int(ROWS - top - 1)}r`;
-    },
-    () => '\x1b[r',
-    () => `\x1b[${1 + int(3)}S`,
-    () => `\x1b[${1 + int(3)}T`,
-    // wide characters
-    () => pick(['你好', '漢字', 'テスト']),
-    // NOTE: DECSC/DECRC (ESC 7 / ESC 8) are deliberately absent: fuzzing
-    // found a real divergence when restoring across a DECSTBM scroll — see
-    // the pinned "known divergence" test below.
-    // insert/delete lines & chars
-    () => `\x1b[${1 + int(3)}L`,
-    () => `\x1b[${1 + int(3)}M`,
-    () => `\x1b[${1 + int(5)}P`,
-    () => `\x1b[${1 + int(5)}@`,
-  ];
-  let out = '';
-  for (let i = 0; i < TOKENS_PER_CASE; i++) out += pick(generators)();
-  return out;
-}
+const { mulberry32, makeTokens } = require('./fuzz-gen');
 
 test('KNOWN DIVERGENCE (fuzz-found): DECRC after scroll inside DECSTBM', async () => {
   // Save cursor on row 1, set a scroll region, scroll it once at the bottom
@@ -85,9 +31,20 @@ test('KNOWN DIVERGENCE (fuzz-found): DECRC after scroll inside DECSTBM', async (
   assert.strictEqual(x[0], 'MARK', 'xterm.js: scroll-adjusted restore to row 0');
 });
 
+test('KNOWN DIVERGENCE (fuzz-found): DECOM homing after DECSTBM', async () => {
+  // With origin mode on, DECSTBM homes the cursor to the region origin
+  // (row 3 for a 4;16 region) and CPL clamps at the top margin — ghostty
+  // does exactly that (matching DEC semantics / classic xterm). xterm.js
+  // lands the cursor rows lower. Minimal repro found by fuzz seed 12.
+  const stream = '\x1b[?6h\x1b[4;16r\x1b[2FMARK';
+  const [g, x] = [ghosttyGrid(stream), await xtermGrid(stream)];
+  assert.strictEqual(g[3], 'MARK', 'ghostty: clamped at region origin (row 3)');
+  assert.strictEqual(x[6], 'MARK', 'xterm.js: lands at row 6');
+});
+
 for (let seed = 1; seed <= CASES; seed++) {
   test(`fuzz stream seed=${seed}`, async () => {
-    const stream = makeStream(mulberry32(seed));
+    const stream = makeTokens(mulberry32(seed), TOKENS_PER_CASE).join('');
     const [g, x] = [ghosttyGrid(stream, COLS, ROWS), await xtermGrid(stream, COLS, ROWS)];
     for (let i = 0; i < ROWS; i++) {
       assert.strictEqual(
