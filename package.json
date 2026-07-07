@@ -11,6 +11,7 @@
     "bench:xterm": "electron xterm-bench/main.js",
     "bench:ghostty": "electron ghostty-bench/main.js",
     "bench": "node bench.js",
+    "bench:pty": "electron pty-bench/main.js",
     "demo": "electron demo/main.js",
     "test": "node --test test/addon.test.js test/conformance.test.js",
     "test:integration": "node --test test/integration.test.js"

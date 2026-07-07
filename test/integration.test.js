@@ -73,6 +73,20 @@ test('sustained mode (5× payload) completes', () => {
   assert.ok(r.frames >= 2, 'multiple frames during sustained feed');
 });
 
+test('pty-bench: sentinel-timed cat race completes with sane metrics', () => {
+  runElectron(['pty-bench/main.js', '--mb', '8', '--interrupt-ms', '500'], 180_000);
+  const r = readResult('pty-bench.json');
+  assert.ok(Math.abs(r.sizeMB - 8) < 1, 'ran the 8 MiB payload');
+  assert.ok(r.pipeCeiling.MBps > 1, 'pipe ceiling measured');
+  for (const key of ['ghostty', 'xterm']) {
+    const t = r[key];
+    assert.ok(t.catMs > 0 && t.catMs < 120_000, `${key} cat completed (${t.catMs}ms)`);
+    assert.ok(t.MBps > 0.5, `${key} throughput sane`);
+    assert.ok(t.interruptMs > 0 && t.interruptMs < 60_000, `${key} interrupt probe completed`);
+  }
+  assert.ok(r.ghostty.ptyChunks > 100, 'pty chunk stats recorded');
+});
+
 test('demo --smoke: zsh echo round-trips through both terminals', () => {
   runElectron(['demo/main.js', '--smoke'], 60_000);
   const r = readResult('demo-smoke.json');

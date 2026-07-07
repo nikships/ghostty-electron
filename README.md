@@ -41,6 +41,37 @@ double-`requestAnimationFrame`). Everything is measured; nothing is modeled.
 
 Reproduce with `npm run bench`. Numbers land in `results/summary.json`.
 
+## The end-to-end race: `cat` 1 GiB in a real shell
+
+`npm run bench:pty` is the full-stack metric: a real zsh on a real PTY
+(node-pty), timed from issuing `cat <1 GiB file>` until the completion
+sentinel is **visible on screen** — not when `cat` exits, which on a
+backlogged terminal happens far earlier. A separate run measures
+**interrupt-to-response**: Ctrl+C mid-flood, then how long until the output
+of a fresh `echo` is visible — i.e. how fast you get your terminal back.
+
+```
+  terminal         cat ms     MB/s   Ctrl+C→PONG ms    cpu s  peak mem MB
+  ──────────────────────────────────────────────────────────────────────────────────
+  xterm           1242060      0.8              729    81.73          797
+  ghostty          104380      9.8               28    15.23          463
+  ──────────────────────────────────────────────────────────────────────────────────
+  cat speedup: 11.9×   interrupt speedup: 26.0×
+```
+
+xterm: **20.7 minutes**. ghostty: **1.7 minutes** — and Ctrl+C answers in
+28 ms vs 729 ms, at 5.4× less total CPU. (Wall times vary run-to-run with
+system load; the ratios are stable. Note node-pty delivers ~1 KB chunks, so
+the PTY plumbing itself caps throughput well below the parsers' raw speed —
+a control run reports this "pipe ceiling" alongside the results.)
+
+Methodology details baked into `pty-bench/`: `zsh -f` + an explicit READY
+handshake (rc-file startup would otherwise pollute the timing), sentinel
+values written as `$((…))` so the echoed command line can't false-match,
+VS Code-style flow control + 4 ms batching on the xterm IPC path (without
+it, per-chunk IPC collapses and a 1 GiB flood OOMs the renderer), and
+`app.getAppMetrics()` sampling for CPU/memory.
+
 **Reading the numbers:**
 - The dominant cost of `cat`-ing a file is the **VT parser**, not pixels.
 - The gap *widens* under sustained load: ghostty finishes the whole 10 MiB in
@@ -150,6 +181,7 @@ native/                    N-API addon: libghostty-vt + CoreText → IOSurface
                            (+ key encoder, scrollback, resize, test hooks)
 xterm-bench/               baseline Electron app (xterm.js + WebGL addon)
 ghostty-bench/             sharedTexture Electron app (producer in main process)
+pty-bench/                 end-to-end race: cat 1 GiB in a real zsh, sentinel-timed
 demo/                      side-by-side interactive demo (node-pty shells)
 test/                      addon + conformance + integration suites
 bench.js                   unified runner (burst + sustained) + table

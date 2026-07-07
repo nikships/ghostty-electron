@@ -1,6 +1,7 @@
 node_modules/
 vendor/
 payload.txt
+payload-*.txt
 results/
 build/
 native/build/

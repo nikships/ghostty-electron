@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>xterm pty-bench</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #0d1117; height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script>
+    const { ipcRenderer } = require('electron');
+    const path = require('path');
+
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = path.join(__dirname, '..', 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css');
+    document.head.appendChild(link);
+
+    const { Terminal } = require('@xterm/xterm');
+    const { WebglAddon } = require('@xterm/addon-webgl');
+
+    let term;
+    let parsedBytes = 0;
+    let lastAckSent = 0;
+    let watchMarker = null;
+    let lastScan = 0;
+
+    // Scan on an interval (not just render/write events) so detection can't
+    // stall when output stops.
+    setInterval(() => { lastScan = 0; scanForMarker(); }, 50);
+
+    let debugScans = 0;
+    function scanForMarker() {
+      if (!watchMarker || !term) return;
+      const t = performance.now();
+      if (t - lastScan < 50) return;
+      lastScan = t;
+      const buf = term.buffer.active;
+      if (++debugScans % 40 === 0) {
+        const tail = [];
+        for (let i = Math.max(0, term.rows - 3); i < term.rows; i++) {
+          const l = buf.getLine(buf.viewportY + i);
+          tail.push(l ? l.translateToString(true) : '<null>');
+        }
+        ipcRenderer.send('x-debug', { viewportY: buf.viewportY, baseY: buf.baseY, tail });
+      }
+      for (let i = 0; i < term.rows; i++) {
+        const line = buf.getLine(buf.viewportY + i);
+        if (line && line.translateToString(true).trim().endsWith(watchMarker)) {
+          const marker = watchMarker;
+          watchMarker = null;
+          // Report only once the frame containing the marker was presented.
+          requestAnimationFrame(() => requestAnimationFrame(() => {
+            ipcRenderer.send('x-found', marker);
+          }));
+          return;
+        }
+      }
+    }
+
+    ipcRenderer.on('x-config', (event, { cols, rows, fontSize }) => {
+      term = new Terminal({
+        cols, rows, fontSize,
+        fontFamily: 'Menlo, monospace',
+        scrollback: 10000,
+        theme: { background: '#1e1e1e' }
+      });
+      term.open(document.getElementById('terminal'));
+      term.loadAddon(new WebglAddon());
+      term.onData((d) => ipcRenderer.send('x-input', d));
+      term.onRender(scanForMarker);
+      term.focus();
+    });
+
+    ipcRenderer.on('x-data', (event, d) => {
+      term.write(d, () => {
+        parsedBytes += d.length;
+        // Flow control ack (VS Code-style): tell main how much we've parsed.
+        if (parsedBytes - lastAckSent > 1024 * 1024) {
+          lastAckSent = parsedBytes;
+          ipcRenderer.send('x-acked', parsedBytes);
+        }
+        scanForMarker();
+      });
+    });
+
+    ipcRenderer.on('x-watch', (event, { marker }) => {
+      watchMarker = marker;
+      lastScan = 0;
+    });
+
+    ipcRenderer.send('x-ready');
+  </script>
+</body>
+</html>
