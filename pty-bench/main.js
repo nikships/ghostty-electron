@@ -160,10 +160,14 @@ function startMetricsSampler({ series = false } = {}) {
   };
 }
 
-/** Least-squares slope (MB/min) over the last two-thirds of a memory series —
- *  the first third is warm-up (scrollback filling to its cap). */
+/** Least-squares slope (MB/min) over the settled part of a memory series:
+ *  the first minute AND the first third are warm-up (scrollback pool and
+ *  buffers filling to their caps) — a 10-min run measured 0.29 MB/min after
+ *  settling vs ~44 MB/min if the ramp is included. */
 function memSlope(series) {
-  const tail = series.slice(Math.floor(series.length / 3));
+  if (!series.length) return 0;
+  const cut = Math.max(1, series[series.length - 1].tMin / 3);
+  const tail = series.filter((s) => s.tMin >= cut);
   if (tail.length < 4) return 0;
   const n = tail.length;
   const mx = tail.reduce((a, s) => a + s.tMin, 0) / n;

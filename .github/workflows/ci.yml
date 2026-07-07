@@ -52,8 +52,8 @@ jobs:
       - name: Input-latency probe
         run: npx electron pty-bench/main.js --latency --mb 8 --samples 4
 
-      - name: Soak (1 min per terminal)
-        run: npx electron pty-bench/main.js --soak-min 1 --mb 16
+      - name: Soak (2 min per terminal; trend measured after warm-up)
+        run: npx electron pty-bench/main.js --soak-min 2 --mb 16
 
       - name: Render-stress benchmark
         run: npm run bench:render
