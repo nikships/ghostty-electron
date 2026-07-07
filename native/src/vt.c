@@ -414,7 +414,9 @@ static napi_value SetSelection(napi_env env, napi_callback_info info) {
 
   GhosttyGridRef refs[2];
   for (int i = 0; i < 2; i++) {
-    refs[i] = (GhosttyGridRef)GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    // GHOSTTY_INIT_SIZED is already a typed compound literal; an extra cast
+    // is an (illegal) struct-to-struct conversion under MSVC.
+    refs[i] = GHOSTTY_INIT_SIZED(GhosttyGridRef);
     GhosttyPoint pt = {
         .tag = GHOSTTY_POINT_TAG_VIEWPORT,
         .value = {.coordinate = {.x = (uint16_t)coords[i * 2],

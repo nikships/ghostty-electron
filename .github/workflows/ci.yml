@@ -62,8 +62,11 @@ jobs:
 
   windows:
     name: Windows (parser + xterm baseline)
-    # windows-latest ships Visual Studio "18", which node-gyp (≤11.x) cannot
-    # identify; windows-2022 carries VS2022 which it handles fine.
+    # windows-latest now maps to Windows 2025 + VS2026 ("Visual Studio 18"),
+    # which node-gyp ≤11.x cannot identify:
+    # https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-VS2026-Readme.md
+    # windows-2022 carries VS2022 which node-gyp handles fine. Revisit when
+    # node-gyp learns VS2026.
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
