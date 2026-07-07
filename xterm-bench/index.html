@@ -20,11 +20,17 @@
     const { Terminal } = require('@xterm/xterm');
     const { WebglAddon } = require('@xterm/addon-webgl');
 
-    const term = new Terminal({ cols: 120, rows: 30, scrollback: 1000 });
-    term.open(document.getElementById('terminal'));
-    const webgl = new WebglAddon();
-    term.loadAddon(webgl);
-    webgl.onContextLoss(() => ipcRenderer.send('bench-error', 'WebGL context lost'));
+    let term;
+    try {
+      term = new Terminal({ cols: 120, rows: 30, scrollback: 1000 });
+      term.open(document.getElementById('terminal'));
+      const webgl = new WebglAddon();
+      term.loadAddon(webgl);
+      webgl.onContextLoss(() => ipcRenderer.send('bench-error', 'WebGL context lost'));
+    } catch (err) {
+      ipcRenderer.send('bench-error', 'terminal init failed: ' + err.message);
+      throw err;
+    }
 
     let frames = 0;
     term.onRender(() => frames++);

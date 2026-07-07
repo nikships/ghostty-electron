@@ -16,6 +16,13 @@ if (!fs.existsSync(PAYLOAD)) {
   process.exit(1);
 }
 
+// Watchdog: a renderer that fails before signaling 'ready' would otherwise
+// hang the benchmark (and CI) forever.
+setTimeout(() => {
+  console.error('watchdog: benchmark did not complete within 180s');
+  app.exit(1);
+}, 180_000);
+
 app.whenReady().then(async () => {
   const win = new BrowserWindow({
     width: 1000,

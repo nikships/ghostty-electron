@@ -13,6 +13,9 @@ const parse = read('parse.json');
 const summary = read('summary.json');
 const pty = read('pty-bench.json');
 const xterm = read('xterm.json');
+const latency = read('pty-latency.json');
+const soak = read('pty-soak.json');
+const stress = read('render-stress.json');
 
 console.log(`## Benchmark results — ${process.platform}/${process.arch}\n`);
 
@@ -47,6 +50,28 @@ if (pty) {
   console.log(`| xterm | ${pty.xterm.catMs} | ${pty.xterm.MBps} | ${pty.xterm.interruptMs} | ${pty.xterm.cpuTotal} | ${pty.xterm.peakMemMB} |`);
   console.log(`| ghostty | ${pty.ghostty.catMs} | ${pty.ghostty.MBps} | ${pty.ghostty.interruptMs} | ${pty.ghostty.cpuTotal} | ${pty.ghostty.peakMemMB} |`);
   console.log('');
+}
+
+if (latency) {
+  console.log('### Input latency (keystroke → echo visible)\n');
+  console.log('| terminal | idle p50 | idle p95 | busy p50 | busy p95 |');
+  console.log('|---|---|---|---|---|');
+  console.log(`| xterm | ${latency.xterm.idleP50Ms} | ${latency.xterm.idleP95Ms} | ${latency.xterm.floodP50Ms} | ${latency.xterm.floodP95Ms} |`);
+  console.log(`| ghostty | ${latency.ghostty.idleP50Ms} | ${latency.ghostty.idleP95Ms} | ${latency.ghostty.floodP50Ms} | ${latency.ghostty.floodP95Ms} |`);
+  console.log('');
+}
+
+if (soak) {
+  console.log(`### Soak (${soak.minutes} min sustained output) — ${soak.pass ? 'PASS' : 'FAIL'}\n`);
+  console.log('| terminal | consumed MB | mem slope MB/min | cpu s |');
+  console.log('|---|---|---|---|');
+  console.log(`| xterm | ${soak.xterm.bytesConsumedMB} | ${soak.xterm.memSlopeMBperMin} | ${soak.xterm.cpuTotal} |`);
+  console.log(`| ghostty | ${soak.ghostty.bytesConsumedMB} | ${soak.ghostty.memSlopeMBperMin} | ${soak.ghostty.cpuTotal} |`);
+  console.log('');
+}
+
+if (stress) {
+  console.log(`### Render stress: ${stress.fullRedrawsPerSec} full-damage 4K redraws/s (avg ${stress.avgRenderMs} ms) — ${stress.verdict}\n`);
 }
 
 if (!parse && !summary && !pty && !xterm) console.log('_no results produced_');
