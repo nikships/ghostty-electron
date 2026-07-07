@@ -55,6 +55,35 @@ cross-process canvas paint); it "fixes itself in a second" (htop's next
 repaint); `getText()` shows labels while the screen doesn't; and it's timing
 dependent (only when a paint lands right before idle).
 
+## Sharpest evidence (added after deeper digging, 3–5 runs each)
+
+Instrumented the consumer to decode the **received VideoFrame** and read back
+its F-bar row, and the addon to report per-surface content:
+
+- During htop's opening burst, every frame the present loop renders+sends has
+  an **empty F-bar** (`teal=0`) — because htop hadn't emitted the F-bar bytes
+  yet at those render instants.
+- The F-bar bytes arrive in a later chunk of the same burst; `getText()`
+  confirms they land in libghostty's grid.
+- Exactly **one more `addon.render()` after the burst** produces a frame with
+  the F-bar (`teal=224`), then `render()` returns null (clean). So the addon
+  is correct — the fix is purely "send that one trailing frame."
+- A faithful simulation of the demo present loop **with acks flowing** DOES
+  send that trailing frame (final presented surface `teal=224`). It only fails
+  when **acks stop**.
+
+The ack comes from the consumer's `frame-presented`, historically sent from a
+double-`requestAnimationFrame`. rAF only fires while the window is
+compositing. So there is a **circular dependency**: present-loop gate waits
+for ack → ack waits for rAF → rAF waits for the window to composite → which
+won't happen again until a new frame is presented. When htop goes idle right
+after its burst, that loop can wedge, and the trailing F-bar frame never ships.
+
+BUT: acking immediately (no rAF) so acks always flow **still** left the F-bar
+blank on screen (`present 0.8ms`, top rows updating, bottom blank). So even
+with the trailing frame sent and acked, its pixels don't reach the window.
+That is the residual, below-JS part.
+
 ## What didn't work (reverted — don't re-try these)
 
 - **Surface ring / triple+ buffering** (rings of 3 and 8): hypothesis was that
@@ -67,6 +96,18 @@ dependent (only when a paint lands right before idle).
   rAF callback isn't driving a compositor frame for the sandboxed OSR-consumer
   window, or the commit is coalesced away when nothing else is animating.
 - **`getContext('2d', { desynchronized: true })` + `clearRect`**: no change.
+- **Full-canvas `fillRect` before `drawImage`** (force full damage rect): no change.
+- **Continuous bounded rAF paint loop** redrawing the latest frame as an
+  `ImageBitmap` for ~1.2s after each frame (keeps the compositor running): no
+  change — F-bar still blank while the loop demonstrably runs.
+- **Ack immediately instead of after double-rAF** (breaks the ack↔rAF↔commit
+  circular stall so acks always flow): the trailing F-bar frame is now sent
+  and acked, but the window STILL shows it blank. This is the key result that
+  localizes the residual bug below the JS API.
+- **Deferred VideoFrame/import release** (hold prev frame+import until next):
+  **stalls** — holding the consumer's imported ref couples to the main
+  process's 2-surface reuse gate and the ack loop wedges. (A ring of surfaces
+  would be needed to even try this, and rings alone didn't help.)
 - **Present-loop ack-gate timeout / re-tick on ack**: these address a
   *different* (real but not-this) failure mode; didn't fix htop.
 - **`webContents.invalidate()` on the consumer window after each ack**
