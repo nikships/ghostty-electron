@@ -31,14 +31,16 @@
 
     const CHUNK_SIZE = 64 * 1024;
 
-    ipcRenderer.on('start', async (event, payloadPath) => {
+    ipcRenderer.on('start', async (event, { payloadPath, repeat }) => {
       try {
         const data = fs.readFileSync(payloadPath, 'latin1');
         const t0 = performance.now();
 
-        for (let off = 0; off < data.length; off += CHUNK_SIZE) {
-          const chunk = data.slice(off, off + CHUNK_SIZE);
-          await new Promise(resolve => term.write(chunk, resolve));
+        for (let r = 0; r < repeat; r++) {
+          for (let off = 0; off < data.length; off += CHUNK_SIZE) {
+            const chunk = data.slice(off, off + CHUNK_SIZE);
+            await new Promise(resolve => term.write(chunk, resolve));
+          }
         }
         const parseMs = performance.now() - t0;
 
@@ -48,14 +50,18 @@
         await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
         const e2eMs = performance.now() - t0;
 
+        const totalBytes = data.length * repeat;
         ipcRenderer.send('done', {
-          payloadBytes: data.length,
+          mode: repeat > 1 ? 'sustained' : 'burst',
+          repeat,
+          payloadBytes: totalBytes,
           parseMs,
           e2eMs,
           frames,
-          throughputMBps: (data.length / (1024 * 1024)) / (e2eMs / 1000),
+          throughputMBps: (totalBytes / (1024 * 1024)) / (e2eMs / 1000),
           cols: term.cols,
-          rows: term.rows
+          rows: term.rows,
+          scale: window.devicePixelRatio
         });
       } catch (err) {
         ipcRenderer.send('bench-error', err.message + '\n' + err.stack);

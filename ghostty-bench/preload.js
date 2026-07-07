@@ -15,6 +15,8 @@ sharedTexture.setSharedTextureReceiver(async (data, meta) => {
     const canvas = document.getElementById('terminal-canvas');
     if (canvas) {
       if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+        // Backing store at full physical resolution; CSS size (set via the
+        // 'init' message) keeps the on-screen size logical → crisp HiDPI.
         canvas.width = frame.displayWidth;
         canvas.height = frame.displayHeight;
       }
@@ -31,6 +33,14 @@ sharedTexture.setSharedTextureReceiver(async (data, meta) => {
     ipcRenderer.send('bench-error', err.message + '\n' + err.stack);
   } finally {
     imported.release();
+  }
+});
+
+ipcRenderer.on('init', (event, { cssWidth, cssHeight }) => {
+  const canvas = document.getElementById('terminal-canvas');
+  if (canvas) {
+    canvas.style.width = cssWidth + 'px';
+    canvas.style.height = cssHeight + 'px';
   }
 });
 

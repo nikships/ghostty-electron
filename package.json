@@ -4,17 +4,25 @@
   "private": true,
   "description": "Benchmark: cat a 1MB file in Electron — xterm.js (WebGL, in-renderer) vs libghostty + native IOSurface producer via Electron sharedTexture",
   "scripts": {
+    "postinstall": "chmod +x node_modules/node-pty/prebuilds/darwin-*/spawn-helper 2>/dev/null || true",
     "payload": "node scripts/gen-payload.js",
     "setup:ghostty": "bash scripts/setup-ghostty.sh",
     "build:native": "cd native && node-gyp rebuild",
     "bench:xterm": "electron xterm-bench/main.js",
     "bench:ghostty": "electron ghostty-bench/main.js",
-    "bench": "node bench.js"
+    "bench": "node bench.js",
+    "demo": "electron demo/main.js",
+    "test": "node --test test/addon.test.js test/conformance.test.js",
+    "test:integration": "node --test test/integration.test.js"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.1.0",
+    "@xterm/addon-fit": "^0.12.0-beta.288",
     "@xterm/addon-webgl": "^0.19.0-beta.288",
+    "@xterm/headless": "^6.1.0-beta.288",
     "@xterm/xterm": "^6.1.0-beta.288",
     "electron": "42.5.0",
-    "node-gyp": "^11.0.0"
+    "node-gyp": "^11.0.0",
+    "node-pty": "^1.1.0"
   }
 }

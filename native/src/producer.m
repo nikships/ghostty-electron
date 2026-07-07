@@ -2,12 +2,26 @@
  * ghostty_producer — native terminal frame producer.
  *
  * libghostty-vt parses the VT stream and maintains terminal state; this addon
- * renders the visible grid with CoreText into an IOSurface that Electron's
- * sharedTexture module can import zero-copy (handle.ioSurface is a Buffer
+ * renders the visible grid with CoreText into IOSurfaces that Electron's
+ * sharedTexture module imports zero-copy (handle.ioSurface is a Buffer
  * holding the process-local IOSurfaceRef).
  *
- * Frames are double-buffered: render() alternates between two IOSurfaces so
- * the GPU can scan out frame N while we draw frame N+1.
+ * Rendering model:
+ *  - HiDPI aware: all pixel dimensions are physical (logical size × scale).
+ *  - Double-buffered: render() alternates between two IOSurfaces so the GPU
+ *    can scan out frame N while frame N+1 is drawn.
+ *  - Dirty-row incremental: each surface only redraws rows modified since
+ *    that surface was last rendered (row modification sequence numbers make
+ *    dirty tracking compatible with double buffering).
+ *  - Glyph runs: ASCII fast path uses a per-font glyph cache and batched
+ *    CTFontDrawGlyphs runs; non-ASCII (CJK/emoji/graphemes) falls back to
+ *    per-cell CTLine drawing.
+ *  - Styles: fg/bg (palette + truecolor), bold (incl. bold-in-bright-colors
+ *    like xterm.js), italic, inverse, underline, strikethrough, cursor
+ *    (block/bar/underline/hollow).
+ *
+ * Also exposes: getText/readPixels/getCursor (testing), resize, scroll, and
+ * mode-aware key encoding via libghostty's key encoder.
  */
 #include <node_api.h>
 #include <stdlib.h>
@@ -38,27 +52,66 @@
     }                                     \
   } while (0)
 
+enum { FONT_REGULAR = 0, FONT_BOLD, FONT_ITALIC, FONT_BOLD_ITALIC, FONT_COUNT };
+
 typedef struct {
   GhosttyTerminal terminal;
   GhosttyRenderState render_state;
   GhosttyRenderStateRowIterator row_iter;
   GhosttyRenderStateRowCells cells;
+  GhosttyKeyEncoder key_encoder;
+  GhosttyKeyEvent key_event;
 
   IOSurfaceRef surfaces[2];
   int surface_index;
 
   CGColorSpaceRef colorspace;
-  CTFontRef font;
-  CTFontRef font_bold;
+  CTFontRef fonts[FONT_COUNT];
+  CGGlyph ascii_glyphs[FONT_COUNT][95];  // glyph cache for 0x20..0x7E
 
   uint16_t cols, rows;
+  double scale;
   double cell_w, cell_h, ascent;
   size_t px_w, px_h;
+
+  // Dirty tracking across double buffering: rows carry the sequence number
+  // of their last modification; each surface carries the sequence it was
+  // last rendered at. A surface redraws rows with row_modified > its seq.
+  uint64_t mod_seq;
+  uint64_t *row_modified;
+  uint64_t surface_seq[2];
+  bool needs_present;
+
+  // Cursor state from the previous accumulate, to dirty vacated rows.
+  bool prev_cursor_valid;
+  uint16_t prev_cursor_x, prev_cursor_y;
 } Session;
 
-static GhosttyColorRgb resolve_color(GhosttyStyleColor color,
-                                     const GhosttyRenderStateColors *colors,
-                                     GhosttyColorRgb fallback) {
+/* ── Cell snapshot used during row drawing ────────────────────────────── */
+typedef struct {
+  char utf8[16];
+  uint8_t utf8_len;   // 0 = empty cell
+  bool is_ascii;      // single printable ASCII byte
+  GhosttyColorRgb fg;
+  GhosttyColorRgb bg;
+  bool has_bg;
+  bool bold, italic, underline, strikethrough;
+} CellSnap;
+
+/** Wide property of the row-cells iterator's current cell. */
+static GhosttyCellWide current_cell_wide(Session *s) {
+  GhosttyCell raw = 0;
+  GhosttyCellWide wide = GHOSTTY_CELL_WIDE_NARROW;
+  if (ghostty_render_state_row_cells_get(
+          s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) ==
+      GHOSTTY_SUCCESS)
+    ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide);
+  return wide;
+}
+
+static GhosttyColorRgb resolve_style_color(GhosttyStyleColor color,
+                                           const GhosttyRenderStateColors *colors,
+                                           GhosttyColorRgb fallback) {
   switch (color.tag) {
     case GHOSTTY_STYLE_COLOR_RGB:
       return color.value.rgb;
@@ -79,17 +132,31 @@ static IOSurfaceRef create_surface(size_t width, size_t height) {
   return IOSurfaceCreate((__bridge CFDictionaryRef)props);
 }
 
+static void set_fill_rgb(CGContextRef ctx, GhosttyColorRgb c) {
+  CGContextSetRGBFillColor(ctx, c.r / 255.0, c.g / 255.0, c.b / 255.0, 1.0);
+}
+
+static void cache_ascii_glyphs(Session *s, int variant) {
+  UniChar chars[95];
+  for (int i = 0; i < 95; i++) chars[i] = (UniChar)(0x20 + i);
+  CTFontGetGlyphsForCharacters(s->fonts[variant], chars,
+                               s->ascii_glyphs[variant], 95);
+}
+
 static void session_free(Session *s) {
   if (!s) return;
+  if (s->key_event) ghostty_key_event_free(s->key_event);
+  if (s->key_encoder) ghostty_key_encoder_free(s->key_encoder);
   if (s->cells) ghostty_render_state_row_cells_free(s->cells);
   if (s->row_iter) ghostty_render_state_row_iterator_free(s->row_iter);
   if (s->render_state) ghostty_render_state_free(s->render_state);
   if (s->terminal) ghostty_terminal_free(s->terminal);
   for (int i = 0; i < 2; i++)
     if (s->surfaces[i]) CFRelease(s->surfaces[i]);
-  if (s->font) CFRelease(s->font);
-  if (s->font_bold) CFRelease(s->font_bold);
+  for (int i = 0; i < FONT_COUNT; i++)
+    if (s->fonts[i]) CFRelease(s->fonts[i]);
   if (s->colorspace) CGColorSpaceRelease(s->colorspace);
+  free(s->row_modified);
   free(s);
 }
 
@@ -97,40 +164,369 @@ static void finalize_session(napi_env env, void *data, void *hint) {
   session_free((Session *)data);
 }
 
-/** create(cols, rows, fontSizePx) → { session, width, height, cellWidth, cellHeight } */
+/* ── Dirty accumulation ───────────────────────────────────────────────── */
+
+/**
+ * Pull dirty state out of the terminal into our sequence-number model and
+ * reset libghostty's dirty flags. Called by render() and getText() so text
+ * readout never eats a pending present.
+ */
+static bool accumulate_dirty(Session *s) {
+  if (ghostty_render_state_update(s->render_state, s->terminal) !=
+      GHOSTTY_SUCCESS)
+    return false;
+
+  GhosttyRenderStateDirty dirty;
+  if (ghostty_render_state_get(s->render_state,
+                               GHOSTTY_RENDER_STATE_DATA_DIRTY,
+                               &dirty) != GHOSTTY_SUCCESS)
+    return false;
+
+  s->mod_seq++;
+
+  if (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE) s->needs_present = true;
+
+  // Global and per-row dirty are independent layers: even on a FULL frame the
+  // per-row flags must be read and cleared, or they leak into later frames.
+  if (dirty != GHOSTTY_RENDER_STATE_DIRTY_FALSE) {
+    bool full = dirty == GHOSTTY_RENDER_STATE_DIRTY_FULL;
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+                             &s->row_iter);
+    uint16_t row = 0;
+    while (ghostty_render_state_row_iterator_next(s->row_iter) &&
+           row < s->rows) {
+      bool row_dirty = false;
+      ghostty_render_state_row_get(s->row_iter,
+                                   GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY,
+                                   &row_dirty);
+      if (full || row_dirty) s->row_modified[row] = s->mod_seq;
+      if (row_dirty) {
+        bool clean = false;
+        ghostty_render_state_row_set(
+            s->row_iter, GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);
+      }
+      row++;
+    }
+  }
+
+  // Cursor movement must dirty both the vacated and the entered row even if
+  // libghostty didn't flag them (e.g. pure cursor repositioning).
+  bool cur_valid = false;
+  uint16_t cx = 0, cy = 0;
+  ghostty_render_state_get(s->render_state,
+                           GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
+                           &cur_valid);
+  if (cur_valid) {
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &cx);
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &cy);
+  }
+  if (cur_valid != s->prev_cursor_valid || cx != s->prev_cursor_x ||
+      cy != s->prev_cursor_y) {
+    if (s->prev_cursor_valid && s->prev_cursor_y < s->rows)
+      s->row_modified[s->prev_cursor_y] = s->mod_seq;
+    if (cur_valid && cy < s->rows) s->row_modified[cy] = s->mod_seq;
+    s->needs_present = true;
+    s->prev_cursor_valid = cur_valid;
+    s->prev_cursor_x = cx;
+    s->prev_cursor_y = cy;
+  }
+
+  GhosttyRenderStateDirty clean_state = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
+  ghostty_render_state_set(s->render_state, GHOSTTY_RENDER_STATE_OPTION_DIRTY,
+                           &clean_state);
+  return true;
+}
+
+/* ── Row drawing ──────────────────────────────────────────────────────── */
+
+/** Read the current row's cells into snapshots. Returns cell count. */
+static int snapshot_row(Session *s, const GhosttyRenderStateColors *colors,
+                        CellSnap *snaps) {
+  ghostty_render_state_row_get(s->row_iter, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
+                               &s->cells);
+  int col = 0;
+  while (ghostty_render_state_row_cells_next(s->cells) && col < s->cols) {
+    CellSnap *snap = &snaps[col];
+    memset(snap, 0, sizeof(*snap));
+    snap->fg = colors->foreground;
+
+    GhosttyCellWide wide = current_cell_wide(s);
+    bool is_spacer = wide == GHOSTTY_CELL_WIDE_SPACER_TAIL ||
+                     wide == GHOSTTY_CELL_WIDE_SPACER_HEAD;
+
+    uint32_t glen = 0;
+    ghostty_render_state_row_cells_get(
+        s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &glen);
+    if (glen > 0 && !is_spacer) {
+      GhosttyBuffer buf = {.ptr = (uint8_t *)snap->utf8,
+                           .cap = sizeof(snap->utf8),
+                           .len = 0};
+      if (ghostty_render_state_row_cells_get(
+              s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
+              &buf) == GHOSTTY_SUCCESS) {
+        snap->utf8_len = (uint8_t)buf.len;
+        snap->is_ascii = buf.len == 1 && snap->utf8[0] >= 0x20 &&
+                         snap->utf8[0] <= 0x7E;
+      }
+    }
+
+    bool has_styling = false;
+    ghostty_render_state_row_cells_get(
+        s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING,
+        &has_styling);
+    if (has_styling) {
+      GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
+      ghostty_render_state_row_cells_get(
+          s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
+
+      snap->bold = style.bold;
+      snap->italic = style.italic;
+      snap->underline = style.underline != 0;
+      snap->strikethrough = style.strikethrough;
+
+      GhosttyColorRgb fg =
+          resolve_style_color(style.fg_color, colors, colors->foreground);
+      // Match xterm.js drawBoldTextInBrightColors: bold + palette 0-7 →
+      // bright variant.
+      if (style.bold && style.fg_color.tag == GHOSTTY_STYLE_COLOR_PALETTE &&
+          style.fg_color.value.palette < 8)
+        fg = colors->palette[style.fg_color.value.palette + 8];
+
+      bool has_bg = style.bg_color.tag != GHOSTTY_STYLE_COLOR_NONE;
+      GhosttyColorRgb bg =
+          resolve_style_color(style.bg_color, colors, colors->background);
+
+      if (style.inverse) {
+        snap->fg = has_bg ? bg : colors->background;
+        snap->bg = fg;
+        snap->has_bg = true;
+      } else {
+        snap->fg = fg;
+        snap->bg = bg;
+        snap->has_bg = has_bg;
+      }
+      if (style.faint) {
+        snap->fg.r = (uint8_t)((snap->fg.r + colors->background.r) / 2);
+        snap->fg.g = (uint8_t)((snap->fg.g + colors->background.g) / 2);
+        snap->fg.b = (uint8_t)((snap->fg.b + colors->background.b) / 2);
+      }
+    }
+    col++;
+  }
+  for (; col < s->cols; col++) {
+    memset(&snaps[col], 0, sizeof(CellSnap));
+    snaps[col].fg = colors->foreground;
+  }
+  return s->cols;
+}
+
+static bool rgb_eq(GhosttyColorRgb a, GhosttyColorRgb b) {
+  return a.r == b.r && a.g == b.g && a.b == b.b;
+}
+
+static int font_variant(const CellSnap *c) {
+  if (c->bold && c->italic) return FONT_BOLD_ITALIC;
+  if (c->bold) return FONT_BOLD;
+  if (c->italic) return FONT_ITALIC;
+  return FONT_REGULAR;
+}
+
+/** Draw one snapshotted row (bg runs, glyph runs, decorations, cursor). */
+static void draw_row(Session *s, CGContextRef ctx, int row_index,
+                     const GhosttyRenderStateColors *colors,
+                     const CellSnap *snaps, int cursor_col,
+                     GhosttyRenderStateCursorVisualStyle cursor_style,
+                     GhosttyColorRgb cursor_color) {
+  double y_top = row_index * s->cell_h;              // top-down pixel space
+  double cg_y = s->px_h - y_top - s->cell_h;         // CG is bottom-up
+  double baseline = s->px_h - y_top - s->ascent;
+
+  // Row background: default fill, then runs of non-default bg.
+  set_fill_rgb(ctx, colors->background);
+  CGContextFillRect(ctx, CGRectMake(0, cg_y, s->px_w, s->cell_h));
+  for (int c = 0; c < s->cols;) {
+    if (!snaps[c].has_bg) { c++; continue; }
+    int run = c + 1;
+    while (run < s->cols && snaps[run].has_bg &&
+           rgb_eq(snaps[run].bg, snaps[c].bg))
+      run++;
+    set_fill_rgb(ctx, snaps[c].bg);
+    CGContextFillRect(ctx, CGRectMake(c * s->cell_w, cg_y,
+                                      (run - c) * s->cell_w, s->cell_h));
+    c = run;
+  }
+
+  // Glyphs: batch consecutive ASCII cells with identical variant+color into
+  // CTFontDrawGlyphs runs; everything else goes through CTLine.
+  CGGlyph glyphs[512];
+  CGPoint positions[512];
+  int run_len = 0, run_variant = -1;
+  GhosttyColorRgb run_fg = colors->foreground;
+
+#define FLUSH_RUN()                                                        \
+  do {                                                                     \
+    if (run_len > 0) {                                                     \
+      set_fill_rgb(ctx, run_fg);                                           \
+      CTFontDrawGlyphs(s->fonts[run_variant], glyphs, positions,           \
+                       run_len, ctx);                                      \
+      run_len = 0;                                                         \
+    }                                                                      \
+  } while (0)
+
+  for (int c = 0; c < s->cols; c++) {
+    const CellSnap *snap = &snaps[c];
+    if (snap->utf8_len == 0 || (snap->is_ascii && snap->utf8[0] == ' '))
+      continue;
+
+    if (snap->is_ascii) {
+      int variant = font_variant(snap);
+      if (run_len > 0 &&
+          (variant != run_variant || !rgb_eq(snap->fg, run_fg) ||
+           run_len == 512))
+        FLUSH_RUN();
+      run_variant = variant;
+      run_fg = snap->fg;
+      glyphs[run_len] = s->ascii_glyphs[variant][snap->utf8[0] - 0x20];
+      positions[run_len] = CGPointMake(c * s->cell_w, baseline);
+      run_len++;
+    } else {
+      FLUSH_RUN();
+      // Non-ASCII: CTLine per cell (handles CJK, emoji, graphemes).
+      CFStringRef str = CFStringCreateWithBytes(
+          NULL, (const UInt8 *)snap->utf8, snap->utf8_len,
+          kCFStringEncodingUTF8, false);
+      if (!str) continue;
+      CGColorRef color = CGColorCreate(
+          s->colorspace, (CGFloat[]){snap->fg.r / 255.0, snap->fg.g / 255.0,
+                                     snap->fg.b / 255.0, 1.0});
+      CFStringRef keys[] = {kCTFontAttributeName,
+                            kCTForegroundColorAttributeName};
+      CFTypeRef values[] = {s->fonts[font_variant(snap)], color};
+      CFDictionaryRef attrs = CFDictionaryCreate(
+          NULL, (const void **)keys, (const void **)values, 2,
+          &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+      CFAttributedStringRef astr =
+          CFAttributedStringCreate(NULL, str, attrs);
+      CTLineRef line = CTLineCreateWithAttributedString(astr);
+      CGContextSetTextPosition(ctx, c * s->cell_w, baseline);
+      CTLineDraw(line, ctx);
+      CFRelease(line);
+      CFRelease(astr);
+      CFRelease(attrs);
+      CGColorRelease(color);
+      CFRelease(str);
+    }
+  }
+  FLUSH_RUN();
+#undef FLUSH_RUN
+
+  // Decorations: underline / strikethrough runs.
+  double u_thick = s->scale;
+  for (int c = 0; c < s->cols;) {
+    if (!snaps[c].underline && !snaps[c].strikethrough) { c++; continue; }
+    bool ul = snaps[c].underline, st = snaps[c].strikethrough;
+    int run = c + 1;
+    while (run < s->cols && snaps[run].underline == ul &&
+           snaps[run].strikethrough == st &&
+           rgb_eq(snaps[run].fg, snaps[c].fg))
+      run++;
+    set_fill_rgb(ctx, snaps[c].fg);
+    if (ul)
+      CGContextFillRect(ctx, CGRectMake(c * s->cell_w, baseline - 2 * u_thick,
+                                        (run - c) * s->cell_w, u_thick));
+    if (st)
+      CGContextFillRect(ctx,
+                        CGRectMake(c * s->cell_w, baseline + s->ascent * 0.3,
+                                   (run - c) * s->cell_w, u_thick));
+    c = run;
+  }
+
+  // Cursor.
+  if (cursor_col >= 0 && cursor_col < s->cols) {
+    double cx = cursor_col * s->cell_w;
+    set_fill_rgb(ctx, cursor_color);
+    switch (cursor_style) {
+      case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR:
+        CGContextFillRect(ctx, CGRectMake(cx, cg_y, 2 * s->scale, s->cell_h));
+        break;
+      case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE:
+        CGContextFillRect(ctx,
+                          CGRectMake(cx, cg_y, s->cell_w, 2 * s->scale));
+        break;
+      case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW:
+        CGContextStrokeRectWithWidth(
+            ctx, CGRectMake(cx + 0.5, cg_y + 0.5, s->cell_w - 1,
+                            s->cell_h - 1),
+            s->scale);
+        break;
+      case GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK:
+      default: {
+        CGContextFillRect(ctx, CGRectMake(cx, cg_y, s->cell_w, s->cell_h));
+        // Redraw the covered glyph in the background color.
+        const CellSnap *snap = &snaps[cursor_col];
+        if (snap->utf8_len > 0 && snap->is_ascii && snap->utf8[0] != ' ') {
+          set_fill_rgb(ctx, colors->background);
+          CGGlyph g =
+              s->ascii_glyphs[font_variant(snap)][snap->utf8[0] - 0x20];
+          CGPoint p = CGPointMake(cx, baseline);
+          CTFontDrawGlyphs(s->fonts[font_variant(snap)], &g, &p, 1, ctx);
+        }
+        break;
+      }
+    }
+  }
+}
+
+/* ── N-API: create ────────────────────────────────────────────────────── */
+
+/** create(cols, rows, fontSizePt, scale) → { session, width, height, cellWidth, cellHeight, scale } */
 static napi_value Create(napi_env env, napi_callback_info info) {
-  size_t argc = 3;
-  napi_value argv[3];
+  size_t argc = 4;
+  napi_value argv[4];
   NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
-  THROW_IF(env, argc < 3, "create(cols, rows, fontSizePx)");
+  THROW_IF(env, argc < 4, "create(cols, rows, fontSizePt, scale)");
 
   uint32_t cols, rows;
-  double font_size;
+  double font_size, scale;
   NAPI_CALL(env, napi_get_value_uint32(env, argv[0], &cols));
   NAPI_CALL(env, napi_get_value_uint32(env, argv[1], &rows));
   NAPI_CALL(env, napi_get_value_double(env, argv[2], &font_size));
+  NAPI_CALL(env, napi_get_value_double(env, argv[3], &scale));
+  THROW_IF(env, cols == 0 || rows == 0 || scale <= 0, "invalid dimensions");
 
   Session *s = calloc(1, sizeof(Session));
   THROW_IF(env, !s, "out of memory");
   s->cols = (uint16_t)cols;
   s->rows = (uint16_t)rows;
+  s->scale = scale;
 
-  s->font = CTFontCreateWithName(CFSTR("Menlo"), font_size, NULL);
-  s->font_bold = CTFontCreateCopyWithSymbolicTraits(
-      s->font, font_size, NULL, kCTFontBoldTrait, kCTFontBoldTrait);
-  if (!s->font_bold) s->font_bold = (CTFontRef)CFRetain(s->font);
+  s->fonts[FONT_REGULAR] =
+      CTFontCreateWithName(CFSTR("Menlo"), font_size * scale, NULL);
+  CTFontSymbolicTraits traits[FONT_COUNT] = {
+      0, kCTFontBoldTrait, kCTFontItalicTrait,
+      kCTFontBoldTrait | kCTFontItalicTrait};
+  for (int i = 1; i < FONT_COUNT; i++) {
+    s->fonts[i] = CTFontCreateCopyWithSymbolicTraits(
+        s->fonts[FONT_REGULAR], font_size * scale, NULL, traits[i],
+        kCTFontBoldTrait | kCTFontItalicTrait);
+    if (!s->fonts[i]) s->fonts[i] = (CTFontRef)CFRetain(s->fonts[FONT_REGULAR]);
+  }
+  for (int i = 0; i < FONT_COUNT; i++) cache_ascii_glyphs(s, i);
 
-  // Cell metrics from the advance of 'M' and the font's vertical metrics.
   UniChar m_char = 'M';
   CGGlyph m_glyph;
-  CTFontGetGlyphsForCharacters(s->font, &m_char, &m_glyph, 1);
+  CTFontGetGlyphsForCharacters(s->fonts[FONT_REGULAR], &m_char, &m_glyph, 1);
   CGSize advance;
-  CTFontGetAdvancesForGlyphs(s->font, kCTFontOrientationHorizontal, &m_glyph,
-                             &advance, 1);
-  s->ascent = CTFontGetAscent(s->font);
+  CTFontGetAdvancesForGlyphs(s->fonts[FONT_REGULAR],
+                             kCTFontOrientationHorizontal, &m_glyph, &advance,
+                             1);
+  s->ascent = CTFontGetAscent(s->fonts[FONT_REGULAR]);
   s->cell_w = ceil(advance.width);
-  s->cell_h = ceil(s->ascent + CTFontGetDescent(s->font) +
-                   CTFontGetLeading(s->font));
+  s->cell_h = ceil(s->ascent + CTFontGetDescent(s->fonts[FONT_REGULAR]) +
+                   CTFontGetLeading(s->fonts[FONT_REGULAR]));
   s->px_w = (size_t)(s->cell_w * cols);
   s->px_h = (size_t)(s->cell_h * rows);
 
@@ -144,20 +540,26 @@ static napi_value Create(napi_env env, napi_callback_info info) {
     }
   }
 
+  s->row_modified = calloc(rows, sizeof(uint64_t));
+
   GhosttyTerminalOptions opts = {
       .cols = s->cols,
       .rows = s->rows,
-      .max_scrollback = 1000,
+      .max_scrollback = 10000,
   };
   if (ghostty_terminal_new(NULL, &s->terminal, opts) != GHOSTTY_SUCCESS ||
       ghostty_render_state_new(NULL, &s->render_state) != GHOSTTY_SUCCESS ||
       ghostty_render_state_row_iterator_new(NULL, &s->row_iter) !=
           GHOSTTY_SUCCESS ||
-      ghostty_render_state_row_cells_new(NULL, &s->cells) != GHOSTTY_SUCCESS) {
+      ghostty_render_state_row_cells_new(NULL, &s->cells) != GHOSTTY_SUCCESS ||
+      ghostty_key_encoder_new(NULL, &s->key_encoder) != GHOSTTY_SUCCESS ||
+      ghostty_key_event_new(NULL, &s->key_event) != GHOSTTY_SUCCESS) {
     session_free(s);
     napi_throw_error(env, NULL, "libghostty-vt initialization failed");
     return NULL;
   }
+  ghostty_terminal_resize(s->terminal, s->cols, s->rows,
+                          (uint32_t)s->cell_w, (uint32_t)s->cell_h);
 
   napi_value session_ext, result, v;
   NAPI_CALL(env, napi_create_external(env, s, finalize_session, NULL,
@@ -172,6 +574,8 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   NAPI_CALL(env, napi_set_named_property(env, result, "cellWidth", v));
   NAPI_CALL(env, napi_create_double(env, s->cell_h, &v));
   NAPI_CALL(env, napi_set_named_property(env, result, "cellHeight", v));
+  NAPI_CALL(env, napi_create_double(env, s->scale, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "scale", v));
   return result;
 }
 
@@ -184,7 +588,8 @@ static Session *get_session(napi_env env, napi_value ext) {
   return (Session *)data;
 }
 
-/** write(session, buffer) — feed VT bytes into the terminal. */
+/* ── N-API: write ─────────────────────────────────────────────────────── */
+
 static napi_value WriteVt(napi_env env, napi_callback_info info) {
   size_t argc = 2;
   napi_value argv[2];
@@ -198,109 +603,14 @@ static napi_value WriteVt(napi_env env, napi_callback_info info) {
   size_t len;
   NAPI_CALL(env, napi_get_buffer_info(env, argv[1], &data, &len));
   ghostty_terminal_vt_write(s->terminal, (const uint8_t *)data, len);
-
   return NULL;
 }
 
-/** Draw one row's cells into the CG context. */
-static void draw_row(Session *s, CGContextRef ctx, int row_index,
-                     const GhosttyRenderStateColors *colors) {
-  double y_top = row_index * s->cell_h;          // top-down pixel space
-  double cg_baseline = s->px_h - y_top - s->ascent;  // CG is bottom-up
-
-  // Collect the row's codepoints (UTF-32) and per-cell styles.
-  uint32_t *cps = malloc(sizeof(uint32_t) * s->cols);
-  GhosttyStyle *styles = malloc(sizeof(GhosttyStyle) * s->cols);
-
-  ghostty_render_state_row_get(s->row_iter, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
-                               &s->cells);
-  int col = 0;
-  while (ghostty_render_state_row_cells_next(s->cells) && col < s->cols) {
-    uint32_t grapheme_len = 0;
-    ghostty_render_state_row_cells_get(
-        s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN,
-        &grapheme_len);
-
-    GhosttyStyle style = GHOSTTY_INIT_SIZED(GhosttyStyle);
-    ghostty_render_state_row_cells_get(
-        s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style);
-    styles[col] = style;
-
-    if (grapheme_len == 0) {
-      cps[col] = ' ';
-    } else {
-      uint32_t buf[32];
-      ghostty_render_state_row_cells_get(
-          s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_BUF, buf);
-      cps[col] = buf[0];  // first codepoint; combining marks skipped
-    }
-    col++;
-  }
-  for (; col < s->cols; col++) {
-    cps[col] = ' ';
-    styles[col] = (GhosttyStyle)GHOSTTY_INIT_SIZED(GhosttyStyle);
-  }
-
-  // Background rects for cells whose bg differs from the default.
-  for (int c = 0; c < s->cols; c++) {
-    if (styles[c].bg_color.tag == GHOSTTY_STYLE_COLOR_NONE) continue;
-    GhosttyColorRgb bg = resolve_color(styles[c].bg_color, colors,
-                                       colors->background);
-    CGContextSetRGBFillColor(ctx, bg.r / 255.0, bg.g / 255.0, bg.b / 255.0, 1);
-    CGContextFillRect(ctx, CGRectMake(c * s->cell_w,
-                                      s->px_h - y_top - s->cell_h,
-                                      s->cell_w, s->cell_h));
-  }
-
-  // Text: one attributed string per row, colored per style run.
-  CFStringRef str = CFStringCreateWithBytes(
-      NULL, (const UInt8 *)cps, s->cols * sizeof(uint32_t),
-      kCFStringEncodingUTF32LE, false);
-  if (!str) {
-    free(cps);
-    free(styles);
-    return;
-  }
-
-  CFMutableAttributedStringRef attr =
-      CFAttributedStringCreateMutable(NULL, 0);
-  CFAttributedStringReplaceString(attr, CFRangeMake(0, 0), str);
-  CFIndex str_len = CFAttributedStringGetLength(attr);
-  CFAttributedStringSetAttribute(attr, CFRangeMake(0, str_len),
-                                 kCTFontAttributeName, s->font);
-
-  // NOTE: UTF-16 index == column only for BMP content; fine for this bench.
-  for (int c = 0; c < s->cols && c < str_len; c++) {
-    GhosttyColorRgb fg =
-        resolve_color(styles[c].fg_color, colors, colors->foreground);
-    CGFloat comps[4] = {fg.r / 255.0, fg.g / 255.0, fg.b / 255.0, 1.0};
-    CGColorRef color = CGColorCreate(s->colorspace, comps);
-    CFAttributedStringSetAttribute(attr, CFRangeMake(c, 1),
-                                   kCTForegroundColorAttributeName, color);
-    CGColorRelease(color);
-    if (styles[c].bold) {
-      CFAttributedStringSetAttribute(attr, CFRangeMake(c, 1),
-                                     kCTFontAttributeName, s->font_bold);
-    }
-  }
-
-  CTLineRef line = CTLineCreateWithAttributedString(attr);
-  CGContextSetTextPosition(ctx, 0, cg_baseline);
-  CTLineDraw(line, ctx);
-
-  CFRelease(line);
-  CFRelease(attr);
-  CFRelease(str);
-  free(cps);
-  free(styles);
-}
+/* ── N-API: render ────────────────────────────────────────────────────── */
 
 /**
- * render(session) → { handle, width, height } | null
- *
- * Updates render state from the terminal; if anything changed, draws the full
- * viewport into the back IOSurface and returns its handle. Returns null when
- * the frame is clean (caller keeps presenting the previous surface).
+ * render(session) → { handle, width, height, rowsDrawn, renderMs } | null
+ * null = nothing changed since the last render.
  */
 static napi_value Render(napi_env env, napi_callback_info info) {
   size_t argc = 1;
@@ -310,18 +620,10 @@ static napi_value Render(napi_env env, napi_callback_info info) {
   Session *s = get_session(env, argv[0]);
   if (!s) return NULL;
 
-  THROW_IF(env,
-           ghostty_render_state_update(s->render_state, s->terminal) !=
-               GHOSTTY_SUCCESS,
-           "render_state_update failed");
+  double t0 = CFAbsoluteTimeGetCurrent();
 
-  GhosttyRenderStateDirty dirty;
-  THROW_IF(env,
-           ghostty_render_state_get(s->render_state,
-                                    GHOSTTY_RENDER_STATE_DATA_DIRTY,
-                                    &dirty) != GHOSTTY_SUCCESS,
-           "render_state_get(DIRTY) failed");
-  if (dirty == GHOSTTY_RENDER_STATE_DIRTY_FALSE) {
+  THROW_IF(env, !accumulate_dirty(s), "render state update failed");
+  if (!s->needs_present) {
     napi_value null_val;
     NAPI_CALL(env, napi_get_null(env, &null_val));
     return null_val;
@@ -333,10 +635,32 @@ static napi_value Render(napi_env env, napi_callback_info info) {
                GHOSTTY_SUCCESS,
            "colors_get failed");
 
-  // Flip buffers and draw the whole viewport (double buffering keeps the
-  // in-flight frame stable; full redraw keeps buffer contents consistent).
+  // Cursor state for this frame.
+  bool cur_visible = false, cur_valid = false;
+  uint16_t ccx = 0, ccy = 0;
+  GhosttyRenderStateCursorVisualStyle cur_style =
+      GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK;
+  ghostty_render_state_get(s->render_state,
+                           GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE,
+                           &cur_visible);
+  ghostty_render_state_get(s->render_state,
+                           GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
+                           &cur_valid);
+  if (cur_visible && cur_valid) {
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &ccx);
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &ccy);
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE,
+                             &cur_style);
+  }
+  GhosttyColorRgb cursor_color =
+      colors.cursor_has_value ? colors.cursor : colors.foreground;
+
   s->surface_index ^= 1;
   IOSurfaceRef surface = s->surfaces[s->surface_index];
+  uint64_t since = s->surface_seq[s->surface_index];
 
   IOSurfaceLock(surface, 0, NULL);
   CGContextRef ctx = CGBitmapContextCreate(
@@ -344,29 +668,32 @@ static napi_value Render(napi_env env, napi_callback_info info) {
       IOSurfaceGetBytesPerRow(surface), s->colorspace,
       kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
 
-  CGContextSetRGBFillColor(ctx, colors.background.r / 255.0,
-                           colors.background.g / 255.0,
-                           colors.background.b / 255.0, 1);
-  CGContextFillRect(ctx, CGRectMake(0, 0, s->px_w, s->px_h));
-
+  CellSnap *snaps = malloc(sizeof(CellSnap) * s->cols);
   ghostty_render_state_get(s->render_state,
                            GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
                            &s->row_iter);
-  int row_index = 0;
-  while (ghostty_render_state_row_iterator_next(s->row_iter)) {
-    draw_row(s, ctx, row_index, &colors);
-    bool clean = false;
-    ghostty_render_state_row_set(s->row_iter,
-                                 GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean);
-    row_index++;
+  int row = 0, rows_drawn = 0;
+  while (ghostty_render_state_row_iterator_next(s->row_iter) &&
+         row < s->rows) {
+    if (s->row_modified[row] > since) {
+      snapshot_row(s, &colors, snaps);
+      int cursor_col =
+          (cur_visible && cur_valid && ccy == row) ? (int)ccx : -1;
+      draw_row(s, ctx, row, &colors, snaps, cursor_col, cur_style,
+               cursor_color);
+      rows_drawn++;
+    }
+    row++;
   }
+  free(snaps);
 
   CGContextRelease(ctx);
   IOSurfaceUnlock(surface, 0, NULL);
 
-  GhosttyRenderStateDirty clean_state = GHOSTTY_RENDER_STATE_DIRTY_FALSE;
-  ghostty_render_state_set(s->render_state, GHOSTTY_RENDER_STATE_OPTION_DIRTY,
-                           &clean_state);
+  s->surface_seq[s->surface_index] = s->mod_seq;
+  s->needs_present = false;
+
+  double render_ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
 
   napi_value result, v, handle;
   NAPI_CALL(env, napi_create_object(env, &result));
@@ -377,17 +704,376 @@ static napi_value Render(napi_env env, napi_callback_info info) {
   NAPI_CALL(env, napi_set_named_property(env, result, "width", v));
   NAPI_CALL(env, napi_create_uint32(env, (uint32_t)s->px_h, &v));
   NAPI_CALL(env, napi_set_named_property(env, result, "height", v));
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)rows_drawn, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "rowsDrawn", v));
+  NAPI_CALL(env, napi_create_double(env, render_ms, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "renderMs", v));
   return result;
 }
 
-static napi_value Init(napi_env env, napi_value exports) {
+/* ── N-API: getText ───────────────────────────────────────────────────── */
+
+/** getText(session) → string[] — viewport rows as UTF-8 text (right-trimmed). */
+static napi_value GetText(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  THROW_IF(env, !accumulate_dirty(s), "render state update failed");
+
+  napi_value lines;
+  NAPI_CALL(env, napi_create_array_with_length(env, s->rows, &lines));
+
+  char *line = malloc((size_t)s->cols * 16 + 1);
+  ghostty_render_state_get(s->render_state,
+                           GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR,
+                           &s->row_iter);
+  uint32_t row = 0;
+  while (ghostty_render_state_row_iterator_next(s->row_iter) &&
+         row < s->rows) {
+    ghostty_render_state_row_get(s->row_iter,
+                                 GHOSTTY_RENDER_STATE_ROW_DATA_CELLS,
+                                 &s->cells);
+    size_t len = 0;
+    while (ghostty_render_state_row_cells_next(s->cells)) {
+      // Spacer cells (after a wide char / at a soft-wrap boundary) contribute
+      // no column to the text, matching xterm's translateToString().
+      GhosttyCellWide wide = current_cell_wide(s);
+      if (wide == GHOSTTY_CELL_WIDE_SPACER_TAIL ||
+          wide == GHOSTTY_CELL_WIDE_SPACER_HEAD)
+        continue;
+      char utf8[16];
+      GhosttyBuffer buf = {.ptr = (uint8_t *)utf8, .cap = sizeof(utf8), .len = 0};
+      if (ghostty_render_state_row_cells_get(
+              s->cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8,
+              &buf) == GHOSTTY_SUCCESS &&
+          buf.len > 0) {
+        memcpy(line + len, utf8, buf.len);
+        len += buf.len;
+      } else {
+        line[len++] = ' ';
+      }
+    }
+    while (len > 0 && line[len - 1] == ' ') len--;  // right-trim
+
+    napi_value str;
+    NAPI_CALL(env, napi_create_string_utf8(env, line, len, &str));
+    NAPI_CALL(env, napi_set_element(env, lines, row, str));
+    row++;
+  }
+  free(line);
+  return lines;
+}
+
+/* ── N-API: readPixels ────────────────────────────────────────────────── */
+
+/** readPixels(session) → { width, height, data: Buffer } — BGRA, tightly packed, from the last-rendered surface. */
+static napi_value ReadPixels(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  IOSurfaceRef surface = s->surfaces[s->surface_index];
+  IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL);
+  const uint8_t *base = IOSurfaceGetBaseAddress(surface);
+  size_t stride = IOSurfaceGetBytesPerRow(surface);
+
+  napi_value data;
+  void *out;
+  NAPI_CALL(env, napi_create_buffer(env, s->px_w * s->px_h * 4, &out, &data));
+  for (size_t y = 0; y < s->px_h; y++)
+    memcpy((uint8_t *)out + y * s->px_w * 4, base + y * stride, s->px_w * 4);
+  IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+
+  napi_value result, v;
+  NAPI_CALL(env, napi_create_object(env, &result));
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)s->px_w, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "width", v));
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)s->px_h, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "height", v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "data", data));
+  return result;
+}
+
+/* ── N-API: getCursor ─────────────────────────────────────────────────── */
+
+/** getCursor(session) → { x, y, visible, style } */
+static napi_value GetCursor(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  THROW_IF(env, !accumulate_dirty(s), "render state update failed");
+
+  bool visible = false, valid = false;
+  uint16_t x = 0, y = 0;
+  GhosttyRenderStateCursorVisualStyle style =
+      GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK;
+  ghostty_render_state_get(s->render_state,
+                           GHOSTTY_RENDER_STATE_DATA_CURSOR_VISIBLE, &visible);
+  ghostty_render_state_get(s->render_state,
+                           GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_HAS_VALUE,
+                           &valid);
+  if (valid) {
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_X, &x);
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_CURSOR_VIEWPORT_Y, &y);
+    ghostty_render_state_get(s->render_state,
+                             GHOSTTY_RENDER_STATE_DATA_CURSOR_VISUAL_STYLE,
+                             &style);
+  }
+
+  const char *style_name = "block";
+  if (style == GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR) style_name = "bar";
+  else if (style == GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE)
+    style_name = "underline";
+  else if (style == GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW)
+    style_name = "hollow";
+
+  napi_value result, v;
+  NAPI_CALL(env, napi_create_object(env, &result));
+  NAPI_CALL(env, napi_create_int32(env, valid ? x : -1, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "x", v));
+  NAPI_CALL(env, napi_create_int32(env, valid ? y : -1, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "y", v));
+  NAPI_CALL(env, napi_get_boolean(env, visible && valid, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "visible", v));
+  NAPI_CALL(env, napi_create_string_utf8(env, style_name, NAPI_AUTO_LENGTH, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "style", v));
+  return result;
+}
+
+/* ── N-API: resize ────────────────────────────────────────────────────── */
+
+/** resize(session, cols, rows) → { width, height } */
+static napi_value Resize(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 3, "resize(session, cols, rows)");
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  uint32_t cols, rows;
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[1], &cols));
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[2], &rows));
+  THROW_IF(env, cols == 0 || rows == 0, "invalid dimensions");
+
+  THROW_IF(env,
+           ghostty_terminal_resize(s->terminal, (uint16_t)cols, (uint16_t)rows,
+                                   (uint32_t)s->cell_w,
+                                   (uint32_t)s->cell_h) != GHOSTTY_SUCCESS,
+           "terminal resize failed");
+
+  s->cols = (uint16_t)cols;
+  s->rows = (uint16_t)rows;
+  s->px_w = (size_t)(s->cell_w * cols);
+  s->px_h = (size_t)(s->cell_h * rows);
+
+  for (int i = 0; i < 2; i++) {
+    CFRelease(s->surfaces[i]);
+    s->surfaces[i] = create_surface(s->px_w, s->px_h);
+    s->surface_seq[i] = 0;
+  }
+  free(s->row_modified);
+  s->row_modified = calloc(rows, sizeof(uint64_t));
+  s->mod_seq++;
+  for (uint32_t i = 0; i < rows; i++) s->row_modified[i] = s->mod_seq;
+  s->needs_present = true;
+
+  napi_value result, v;
+  NAPI_CALL(env, napi_create_object(env, &result));
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)s->px_w, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "width", v));
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)s->px_h, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "height", v));
+  return result;
+}
+
+/* ── N-API: scroll ────────────────────────────────────────────────────── */
+
+/** scroll(session, deltaRows) — negative scrolls up (into scrollback). */
+static napi_value Scroll(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 2, "scroll(session, deltaRows)");
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  int32_t delta;
+  NAPI_CALL(env, napi_get_value_int32(env, argv[1], &delta));
+
+  GhosttyTerminalScrollViewport behavior = {
+      .tag = GHOSTTY_SCROLL_VIEWPORT_DELTA,
+      .value = {.delta = (intptr_t)delta},
+  };
+  ghostty_terminal_scroll_viewport(s->terminal, behavior);
+  return NULL;
+}
+
+/* ── N-API: encodeKey ─────────────────────────────────────────────────── */
+
+typedef struct {
+  const char *code;
+  GhosttyKey key;
+} KeyMapEntry;
+
+static const KeyMapEntry KEY_MAP[] = {
+    {"Backquote", GHOSTTY_KEY_BACKQUOTE},
+    {"Backslash", GHOSTTY_KEY_BACKSLASH},
+    {"BracketLeft", GHOSTTY_KEY_BRACKET_LEFT},
+    {"BracketRight", GHOSTTY_KEY_BRACKET_RIGHT},
+    {"Comma", GHOSTTY_KEY_COMMA},
+    {"Equal", GHOSTTY_KEY_EQUAL},
+    {"Minus", GHOSTTY_KEY_MINUS},
+    {"Period", GHOSTTY_KEY_PERIOD},
+    {"Quote", GHOSTTY_KEY_QUOTE},
+    {"Semicolon", GHOSTTY_KEY_SEMICOLON},
+    {"Slash", GHOSTTY_KEY_SLASH},
+    {"Backspace", GHOSTTY_KEY_BACKSPACE},
+    {"Enter", GHOSTTY_KEY_ENTER},
+    {"Space", GHOSTTY_KEY_SPACE},
+    {"Tab", GHOSTTY_KEY_TAB},
+    {"Delete", GHOSTTY_KEY_DELETE},
+    {"End", GHOSTTY_KEY_END},
+    {"Home", GHOSTTY_KEY_HOME},
+    {"Insert", GHOSTTY_KEY_INSERT},
+    {"PageDown", GHOSTTY_KEY_PAGE_DOWN},
+    {"PageUp", GHOSTTY_KEY_PAGE_UP},
+    {"ArrowDown", GHOSTTY_KEY_ARROW_DOWN},
+    {"ArrowLeft", GHOSTTY_KEY_ARROW_LEFT},
+    {"ArrowRight", GHOSTTY_KEY_ARROW_RIGHT},
+    {"ArrowUp", GHOSTTY_KEY_ARROW_UP},
+    {"Escape", GHOSTTY_KEY_ESCAPE},
+    {"NumpadEnter", GHOSTTY_KEY_NUMPAD_ENTER},
+};
+
+static GhosttyKey map_key_code(const char *code) {
+  // KeyA..KeyZ / Digit0..Digit9 / F1..F12 handled arithmetically.
+  if (strncmp(code, "Key", 3) == 0 && code[3] >= 'A' && code[3] <= 'Z' &&
+      code[4] == 0)
+    return (GhosttyKey)(GHOSTTY_KEY_A + (code[3] - 'A'));
+  if (strncmp(code, "Digit", 5) == 0 && code[5] >= '0' && code[5] <= '9' &&
+      code[6] == 0)
+    return (GhosttyKey)(GHOSTTY_KEY_DIGIT_0 + (code[5] - '0'));
+  if (code[0] == 'F' && code[1] >= '1' && code[1] <= '9') {
+    int n = atoi(code + 1);
+    if (n >= 1 && n <= 12) return (GhosttyKey)(GHOSTTY_KEY_F1 + (n - 1));
+  }
+  for (size_t i = 0; i < sizeof(KEY_MAP) / sizeof(KEY_MAP[0]); i++)
+    if (strcmp(code, KEY_MAP[i].code) == 0) return KEY_MAP[i].key;
+  return GHOSTTY_KEY_UNIDENTIFIED;
+}
+
+/**
+ * encodeKey(session, { code, utf8?, shift?, ctrl?, alt?, super?, action? })
+ *   → Buffer (may be empty)
+ * Mode-aware: encoder options are refreshed from the terminal each call, so
+ * DECCKM / keypad / kitty protocol states are respected.
+ */
+static napi_value EncodeKey(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 2, "encodeKey(session, event)");
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  char code[32] = {0};
+  char utf8[16] = {0};
+  size_t utf8_len = 0;
+  bool shift = false, ctrl = false, alt = false, superk = false;
+  char action[16] = "press";
+
+  napi_value v;
+  bool has;
+  NAPI_CALL(env, napi_has_named_property(env, argv[1], "code", &has));
+  if (has) {
+    NAPI_CALL(env, napi_get_named_property(env, argv[1], "code", &v));
+    napi_get_value_string_utf8(env, v, code, sizeof(code), NULL);
+  }
+  NAPI_CALL(env, napi_has_named_property(env, argv[1], "utf8", &has));
+  if (has) {
+    NAPI_CALL(env, napi_get_named_property(env, argv[1], "utf8", &v));
+    napi_get_value_string_utf8(env, v, utf8, sizeof(utf8), &utf8_len);
+  }
+  NAPI_CALL(env, napi_has_named_property(env, argv[1], "action", &has));
+  if (has) {
+    NAPI_CALL(env, napi_get_named_property(env, argv[1], "action", &v));
+    napi_get_value_string_utf8(env, v, action, sizeof(action), NULL);
+  }
+#define GET_BOOL(name, out)                                              \
+  do {                                                                   \
+    NAPI_CALL(env, napi_has_named_property(env, argv[1], name, &has));   \
+    if (has) {                                                           \
+      NAPI_CALL(env, napi_get_named_property(env, argv[1], name, &v));   \
+      napi_get_value_bool(env, v, &(out));                               \
+    }                                                                    \
+  } while (0)
+  GET_BOOL("shift", shift);
+  GET_BOOL("ctrl", ctrl);
+  GET_BOOL("alt", alt);
+  GET_BOOL("super", superk);
+#undef GET_BOOL
+
+  // Refresh encoder options from current terminal modes (DECCKM etc.).
+  ghostty_key_encoder_setopt_from_terminal(s->key_encoder, s->terminal);
+
+  GhosttyKeyAction act = GHOSTTY_KEY_ACTION_PRESS;
+  if (strcmp(action, "release") == 0) act = GHOSTTY_KEY_ACTION_RELEASE;
+  else if (strcmp(action, "repeat") == 0) act = GHOSTTY_KEY_ACTION_REPEAT;
+
+  GhosttyMods mods = 0;
+  if (shift) mods |= GHOSTTY_MODS_SHIFT;
+  if (ctrl) mods |= GHOSTTY_MODS_CTRL;
+  if (alt) mods |= GHOSTTY_MODS_ALT;
+  if (superk) mods |= GHOSTTY_MODS_SUPER;
+
+  ghostty_key_event_set_action(s->key_event, act);
+  ghostty_key_event_set_key(s->key_event, map_key_code(code));
+  ghostty_key_event_set_mods(s->key_event, mods);
+  ghostty_key_event_set_utf8(s->key_event, utf8, utf8_len);
+
+  char out[128];
+  size_t written = 0;
+  GhosttyResult res = ghostty_key_encoder_encode(s->key_encoder, s->key_event,
+                                                 out, sizeof(out), &written);
+  if (res != GHOSTTY_SUCCESS) written = 0;
+
+  napi_value buf;
+  void *data;
+  NAPI_CALL(env, napi_create_buffer_copy(env, written, out, &data, &buf));
+  return buf;
+}
+
+/* ── Module init ──────────────────────────────────────────────────────── */
+
+NAPI_MODULE_INIT() {
   napi_property_descriptor props[] = {
       {"create", NULL, Create, NULL, NULL, NULL, napi_default, NULL},
       {"write", NULL, WriteVt, NULL, NULL, NULL, napi_default, NULL},
       {"render", NULL, Render, NULL, NULL, NULL, napi_default, NULL},
+      {"getText", NULL, GetText, NULL, NULL, NULL, napi_default, NULL},
+      {"readPixels", NULL, ReadPixels, NULL, NULL, NULL, napi_default, NULL},
+      {"getCursor", NULL, GetCursor, NULL, NULL, NULL, napi_default, NULL},
+      {"resize", NULL, Resize, NULL, NULL, NULL, napi_default, NULL},
+      {"scroll", NULL, Scroll, NULL, NULL, NULL, napi_default, NULL},
+      {"encodeKey", NULL, EncodeKey, NULL, NULL, NULL, napi_default, NULL},
   };
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
   return exports;
 }
-
-NAPI_MODULE(ghostty_producer, Init)

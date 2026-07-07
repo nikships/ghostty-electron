@@ -29,8 +29,11 @@ app.whenReady().then(async () => {
 
   // Handlers must be registered before loadFile: the page signals 'ready'
   // on DOMContentLoaded, which fires before loadFile() resolves.
+  const repeatIdx = process.argv.indexOf('--repeat');
+  const repeat = repeatIdx !== -1 ? parseInt(process.argv[repeatIdx + 1], 10) : 1;
+
   ipcMain.on('ready', () => {
-    win.webContents.send('start', PAYLOAD);
+    win.webContents.send('start', { payloadPath: PAYLOAD, repeat });
   });
 
   ipcMain.on('done', async (event, results) => {

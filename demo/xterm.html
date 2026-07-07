@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>xterm.js + WebGL</title>
+  <style>
+    * { margin: 0; padding: 0; }
+    body { background: #0d1117; height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+    #stats {
+      position: fixed; top: 6px; right: 8px;
+      font: 11px Menlo, monospace; color: #79c0ff;
+      background: rgba(0,0,0,0.6); padding: 3px 8px; border-radius: 4px;
+      pointer-events: none; z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <div id="stats">—</div>
+  <script>
+    const { ipcRenderer } = require('electron');
+    const path = require('path');
+
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = path.join(__dirname, '..', 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css');
+    document.head.appendChild(link);
+
+    const { Terminal } = require('@xterm/xterm');
+    const { WebglAddon } = require('@xterm/addon-webgl');
+
+    let term;
+    let frames = 0;
+    setInterval(() => {
+      document.getElementById('stats').textContent = `${frames} fps`;
+      frames = 0;
+    }, 1000);
+
+    ipcRenderer.on('x-config', (event, { cols, rows, fontSize }) => {
+      term = new Terminal({
+        cols,
+        rows,
+        fontSize,
+        fontFamily: 'Menlo, monospace',
+        scrollback: 10000,
+        theme: { background: '#1e1e1e' }
+      });
+      term.open(document.getElementById('terminal'));
+      term.loadAddon(new WebglAddon());
+      term.onRender(() => frames++);
+      term.onData((d) => ipcRenderer.send('x-input', d));
+      term.onResize(({ cols, rows }) => ipcRenderer.send('x-resize', { cols, rows }));
+      term.focus();
+    });
+
+    ipcRenderer.on('x-data', (event, d) => term && term.write(d));
+
+    ipcRenderer.on('x-get-text', () => {
+      const lines = [];
+      if (term) {
+        const buf = term.buffer.active;
+        for (let i = 0; i < term.rows; i++) {
+          const line = buf.getLine(buf.viewportY + i);
+          lines.push(line ? line.translateToString(true) : '');
+        }
+      }
+      ipcRenderer.send('x-text', lines);
+    });
+
+    ipcRenderer.send('x-ready');
+  </script>
+</body>
+</html>

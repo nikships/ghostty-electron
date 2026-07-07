@@ -1,15 +1,18 @@
 'use strict';
 /**
- * libghostty + sharedTexture: cat a 1MB file through libghostty-vt in the
- * main process, render the grid natively into an IOSurface (CoreText), and
- * present it in a sandboxed renderer <canvas> via Electron's sharedTexture
- * module (IOSurface → importSharedTexture → sendSharedTexture → VideoFrame).
+ * libghostty + sharedTexture: cat a payload through libghostty-vt in the
+ * main process, render the grid natively into an IOSurface (CoreText,
+ * HiDPI-scaled, dirty-row incremental), and present it in a sandboxed
+ * renderer <canvas> via Electron's sharedTexture module.
  *
- * Measures: first byte fed → final frame presented in the consumer canvas
- * (consumer acks after drawImage + double rAF, same finish line as the
- * xterm baseline).
+ * Measures per stage: write (parse), render (native draw), send (import +
+ * transfer), and per-frame present latency (send → consumer double-rAF ack).
+ * e2e = first byte fed → final frame presented.
+ *
+ * Flags: --repeat N (sustained mode, feeds the payload N times),
+ *        --screenshot (dump final frame to results/).
  */
-const { app, BrowserWindow, ipcMain, sharedTexture } = require('electron');
+const { app, BrowserWindow, ipcMain, screen, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');
 
@@ -21,18 +24,30 @@ if (!fs.existsSync(PAYLOAD)) {
   process.exit(1);
 }
 
+function flagValue(name, fallback) {
+  const i = process.argv.indexOf(name);
+  return i !== -1 ? parseInt(process.argv[i + 1], 10) : fallback;
+}
+
 const COLS = 120;
 const ROWS = 30;
 const FONT_SIZE = 13;
 const CHUNK_SIZE = 64 * 1024;
 const FRAME_INTERVAL_MS = 16; // present at ~60fps cadence while feeding
+const REPEAT = flagValue('--repeat', 1);
+
+function percentile(sorted, p) {
+  if (sorted.length === 0) return 0;
+  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))];
+}
 
 app.whenReady().then(async () => {
-  const term = addon.create(COLS, ROWS, FONT_SIZE);
+  const scale = screen.getPrimaryDisplay().scaleFactor;
+  const term = addon.create(COLS, ROWS, FONT_SIZE, scale);
 
   const win = new BrowserWindow({
-    width: term.width + 40,
-    height: term.height + 60,
+    width: Math.ceil(term.width / scale) + 40,
+    height: Math.ceil(term.height / scale) + 60,
     show: true,
     webPreferences: {
       sandbox: true,
@@ -41,17 +56,20 @@ app.whenReady().then(async () => {
   });
 
   let seq = 0;
+  let renderMs = 0;
+  let sendMs = 0;
+  const pendingSendTimes = new Map();
+  const presentLatencies = [];
 
   async function presentFrame(isFinal) {
     const frame = addon.render(term.session);
-    if (!frame && !isFinal) return false;
-    if (!frame && isFinal) {
-      // Nothing new to draw but we still need the final ack: re-present by
-      // telling the consumer the last frame it drew was final.
-      win.webContents.send('no-frame-final');
-      return false;
+    if (!frame) {
+      if (isFinal) win.webContents.send('no-frame-final');
+      return;
     }
+    renderMs += frame.renderMs;
     seq++;
+    const t0 = performance.now();
     const imported = sharedTexture.importSharedTexture({
       textureInfo: {
         codedSize: { width: frame.width, height: frame.height },
@@ -59,62 +77,92 @@ app.whenReady().then(async () => {
         handle: { ioSurface: frame.handle }
       }
     });
+    pendingSendTimes.set(seq, t0);
     await sharedTexture.sendSharedTexture(
       { frame: win.webContents.mainFrame, importedSharedTexture: imported },
       { seq, isFinal }
     );
     imported.release();
-    return true;
+    sendMs += performance.now() - t0;
   }
 
+  let finish = null;
+  ipcMain.on('frame-presented', (event, ack) => {
+    const sentAt = pendingSendTimes.get(ack.seq);
+    if (sentAt !== undefined) {
+      presentLatencies.push(performance.now() - sentAt);
+      pendingSendTimes.delete(ack.seq);
+    }
+    if (ack.isFinal && finish) finish();
+  });
+
   // Handlers must be registered before loadFile: the preload signals
-  // 'renderer-ready' on DOMContentLoaded, before loadFile() resolves.
+  // 'renderer-ready' after first paint, before loadFile() resolves... but
+  // register early anyway to avoid ordering races.
   ipcMain.on('renderer-ready', async () => {
+    win.webContents.send('init', {
+      cssWidth: term.width / scale,
+      cssHeight: term.height / scale
+    });
     try {
       const data = fs.readFileSync(PAYLOAD);
       const t0 = performance.now();
-
+      let writeMs = 0;
       let lastPresent = 0;
-      for (let off = 0; off < data.length; off += CHUNK_SIZE) {
-        addon.write(term.session, data.subarray(off, off + CHUNK_SIZE));
-        const now = performance.now();
-        if (now - lastPresent >= FRAME_INTERVAL_MS) {
-          lastPresent = now;
-          await presentFrame(false);
+
+      for (let r = 0; r < REPEAT; r++) {
+        for (let off = 0; off < data.length; off += CHUNK_SIZE) {
+          const chunk = data.subarray(off, off + CHUNK_SIZE);
+          const tw = performance.now();
+          addon.write(term.session, chunk);
+          writeMs += performance.now() - tw;
+          if (performance.now() - lastPresent >= FRAME_INTERVAL_MS) {
+            lastPresent = performance.now();
+            await presentFrame(false);
+          }
         }
       }
       const parseMs = performance.now() - t0;
 
-      // Final frame carries isFinal; the consumer acks once it is on screen.
-      const finalSeq = seq + 1;
-      ipcMain.on('frame-presented', async (event, ack) => {
-        if (!ack.isFinal) return;
-        const e2eMs = performance.now() - t0;
-        const out = {
-          backend: 'libghostty-vt + native IOSurface producer + sharedTexture',
-          payloadBytes: data.length,
-          parseMs,
-          e2eMs,
-          frames: finalSeq,
-          throughputMBps: (data.length / (1024 * 1024)) / (e2eMs / 1000),
-          cols: COLS,
-          rows: ROWS,
-          electronVersion: process.versions.electron,
-          chromiumVersion: process.versions.chrome,
-          platform: process.platform,
-          arch: process.arch
-        };
-        console.log(JSON.stringify(out, null, 2));
-        const resultsDir = path.join(__dirname, '..', 'results');
-        fs.mkdirSync(resultsDir, { recursive: true });
-        fs.writeFileSync(path.join(resultsDir, 'ghostty.json'), JSON.stringify(out, null, 2));
-        if (process.argv.includes('--screenshot')) {
-          const img = await win.webContents.capturePage();
-          fs.writeFileSync(path.join(resultsDir, 'ghostty-frame.png'), img.toPNG());
-        }
-        app.quit();
-      });
+      const done = new Promise(resolve => { finish = resolve; });
       await presentFrame(true);
+      await done;
+
+      const e2eMs = performance.now() - t0;
+      presentLatencies.sort((a, b) => a - b);
+      const totalBytes = data.length * REPEAT;
+      const out = {
+        backend: 'libghostty-vt + native IOSurface producer + sharedTexture',
+        mode: REPEAT > 1 ? 'sustained' : 'burst',
+        repeat: REPEAT,
+        payloadBytes: totalBytes,
+        parseMs,
+        writeMs,
+        renderMs,
+        sendMs,
+        e2eMs,
+        frames: seq,
+        presentP50Ms: percentile(presentLatencies, 0.5),
+        presentP95Ms: percentile(presentLatencies, 0.95),
+        throughputMBps: (totalBytes / (1024 * 1024)) / (e2eMs / 1000),
+        cols: COLS,
+        rows: ROWS,
+        scale,
+        surfacePx: { width: term.width, height: term.height },
+        electronVersion: process.versions.electron,
+        chromiumVersion: process.versions.chrome,
+        platform: process.platform,
+        arch: process.arch
+      };
+      console.log(JSON.stringify(out, null, 2));
+      const resultsDir = path.join(__dirname, '..', 'results');
+      fs.mkdirSync(resultsDir, { recursive: true });
+      fs.writeFileSync(path.join(resultsDir, 'ghostty.json'), JSON.stringify(out, null, 2));
+      if (process.argv.includes('--screenshot')) {
+        const img = await win.webContents.capturePage();
+        fs.writeFileSync(path.join(resultsDir, 'ghostty-frame.png'), img.toPNG());
+      }
+      app.quit();
     } catch (err) {
       console.error('benchmark error:', err);
       app.exit(1);
