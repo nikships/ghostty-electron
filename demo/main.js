@@ -61,7 +61,10 @@ app.whenReady().then(async () => {
   });
 
   ptyG.onData((d) => {
-    addon.write(term.session, Buffer.from(d, 'utf8'));
+    // write() returns terminal query responses (CPR/DA/…) that must go back
+    // to the PTY — ncurses apps stall for seconds without them.
+    const resp = addon.write(term.session, Buffer.from(d, 'utf8'));
+    if (resp && resp.length) ptyG.write(resp.toString('binary'));
   });
 
   // Present loop: ~120Hz dirty checks; render() returns null when clean so
@@ -118,7 +121,11 @@ app.whenReady().then(async () => {
       sendBusy = false;
     }
   }
-  const presentTimer = setInterval(presentTick, 8);
+  // Present only after the consumer's first paint: a sharedTexture sent
+  // into a window that hasn't composited yet stalls ~1s inside Electron and
+  // the acks stall behind it — the screen then lags the grid by up to a
+  // second right at startup (mid-paint htop frames stuck on screen).
+  let presentTimer = null;
 
   ipcMain.on('frame-presented', (event, ack) => {
     maxAckedSeq = Math.max(maxAckedSeq, ack.seq);
@@ -151,6 +158,7 @@ app.whenReady().then(async () => {
       cellWidth: term.cellWidth / scale,
       cellHeight: term.cellHeight / scale
     });
+    if (!presentTimer) presentTimer = setInterval(presentTick, 8);
   });
 
   let hasSelection = false;
@@ -331,6 +339,24 @@ app.whenReady().then(async () => {
     try { ptyG.kill(); } catch {}
     try { ptyX.kill(); } catch {}
   });
+
+  /* ─── debug: auto-type + timed screenshots (GXB_AUTOTYPE) ──────────── */
+  if (process.env.GXB_AUTOTYPE) {
+    setTimeout(() => {
+      const text = process.env.GXB_AUTOTYPE.replace(/\\r/g, '\r');
+      ptyG.write(text);
+      ptyX.write(text);
+    }, 1200);
+    const shots = [1800, 3500, 8000];
+    shots.forEach((ms, i) => setTimeout(async () => {
+      const img = await ghosttyWin.webContents.capturePage();
+      fs.mkdirSync(path.join(__dirname, '..', 'results'), { recursive: true });
+      fs.writeFileSync(path.join(__dirname, '..', 'results', `autotype-${i}.png`), img.toPNG());
+      const xImg = await xtermWin.webContents.capturePage();
+      fs.writeFileSync(path.join(__dirname, '..', 'results', `autotype-xterm-${i}.png`), xImg.toPNG());
+      if (i === shots.length - 1) app.exit(0);
+    }, ms));
+  }
 
   /* ─── smoke mode for integration tests ─────────────────────────────── */
   if (SMOKE) {

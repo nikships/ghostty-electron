@@ -226,7 +226,10 @@ async function ghosttyRun(file, { interrupt, latency, soak }) {
     chunks++;
     chunkBytes += d.length;
     if (!doneArrivedAt && d.includes(DONE)) doneArrivedAt = now();
-    try { addon.write(term.session, Buffer.from(d, 'utf8')); } catch {}
+    try {
+      const resp = addon.write(term.session, Buffer.from(d, 'utf8'));
+      if (resp && resp.length) shell.write(resp.toString('binary'));
+    } catch {}
   });
   const gDebugTimer = process.env.PTYBENCH_DEBUG
     ? setInterval(() => console.log(`  [ghostty] rx=${(chunkBytes / 1048576).toFixed(1)}MB chunks=${chunks} seq=${seq} acked=${maxAcked}`), 2000)

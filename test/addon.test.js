@@ -280,6 +280,27 @@ test('selection: set, render inverted, extract text, clear', RENDER, () => {
   assert.ok(f, 'clearing selection re-renders');
 });
 
+test('query responses: CPR and DA are returned from write()', () => {
+  // ncurses apps (htop) send these at startup and stall for seconds if the
+  // terminal never answers — write() must return the generated responses so
+  // the host can feed them back to the PTY.
+  const t = makeTerm();
+  write(t, 'ab\r\ncd');
+
+  const cpr = addon.write(t.session, Buffer.from('\x1b[6n'));
+  assert.ok(cpr && cpr.length, 'CPR generates a response');
+  assert.match(cpr.toString('latin1'), /^\x1b\[2;3R$/, 'reports row 2 col 3 (1-based)');
+
+  const da1 = addon.write(t.session, Buffer.from('\x1b[c'));
+  assert.match(da1.toString('latin1'), /^\x1b\[\?62;/, 'DA1 advertises VT220 class');
+
+  const da2 = addon.write(t.session, Buffer.from('\x1b[>c'));
+  assert.match(da2.toString('latin1'), /^\x1b\[>1;/, 'DA2 reports device type');
+
+  // Plain content produces no response.
+  assert.strictEqual(addon.write(t.session, Buffer.from('hello')), undefined);
+});
+
 test('key encoding: printables and control keys', () => {
   const t = makeTerm();
   const enc = (ev) => addon.encodeKey(t.session, ev).toString('latin1');

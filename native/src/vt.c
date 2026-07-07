@@ -102,6 +102,46 @@ bool gxb_accumulate_dirty(Session *s) {
   return true;
 }
 
+/* ── Query-response effects ───────────────────────────────────────────────
+ * By default libghostty-vt silently ignores sequences that require answers
+ * (DSR/CPR, DA, …). ncurses applications block on those during startup —
+ * htop showed a skeleton for seconds until its query timed out. We buffer
+ * the responses here and hand them back to JS from write(). */
+
+static void on_write_pty(GhosttyTerminal terminal, void *userdata,
+                         const uint8_t *data, size_t len) {
+  (void)terminal;
+  Session *s = (Session *)userdata;
+  if (s->resp_len + len > s->resp_cap) {
+    size_t cap = s->resp_cap ? s->resp_cap * 2 : 256;
+    while (cap < s->resp_len + len) cap *= 2;
+    uint8_t *grown = realloc(s->resp, cap);
+    if (!grown) return;  // drop the response rather than crash
+    s->resp = grown;
+    s->resp_cap = cap;
+  }
+  memcpy(s->resp + s->resp_len, data, len);
+  s->resp_len += len;
+}
+
+static bool on_device_attributes(GhosttyTerminal terminal, void *userdata,
+                                 GhosttyDeviceAttributes *out) {
+  (void)terminal;
+  (void)userdata;
+  // Advertise a VT220-class terminal with ANSI color — the same class
+  // xterm-256color/xterm.js report.
+  out->primary.conformance_level = GHOSTTY_DA_CONFORMANCE_VT220;
+  out->primary.features[0] = GHOSTTY_DA_FEATURE_SELECTIVE_ERASE;
+  out->primary.features[1] = GHOSTTY_DA_FEATURE_ANSI_COLOR;
+  out->primary.features[2] = GHOSTTY_DA_FEATURE_CLIPBOARD;
+  out->primary.num_features = 3;
+  out->secondary.device_type = GHOSTTY_DA_DEVICE_TYPE_VT220;
+  out->secondary.firmware_version = 10000;
+  out->secondary.rom_cartridge = 0;
+  out->tertiary.unit_id = 0;
+  return true;
+}
+
 static void session_free(Session *s) {
   if (!s) return;
   if (s->key_event) ghostty_key_event_free(s->key_event);
@@ -111,6 +151,7 @@ static void session_free(Session *s) {
   if (s->render_state) ghostty_render_state_free(s->render_state);
   if (s->terminal) ghostty_terminal_free(s->terminal);
   gxb_platform_free(s);
+  free(s->resp);
   free(s->row_modified);
   free(s);
 }
@@ -175,6 +216,13 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   ghostty_terminal_resize(s->terminal, s->cols, s->rows,
                           (uint32_t)s->cell_w, (uint32_t)s->cell_h);
 
+  // Enable query responses (see on_write_pty above).
+  ghostty_terminal_set(s->terminal, GHOSTTY_TERMINAL_OPT_USERDATA, s);
+  ghostty_terminal_set(s->terminal, GHOSTTY_TERMINAL_OPT_WRITE_PTY,
+                       (const void *)on_write_pty);
+  ghostty_terminal_set(s->terminal, GHOSTTY_TERMINAL_OPT_DEVICE_ATTRIBUTES,
+                       (const void *)on_device_attributes);
+
   napi_value session_ext, result, v;
   NAPI_CALL(env, napi_create_external(env, s, finalize_session, NULL,
                                       &session_ext));
@@ -208,6 +256,16 @@ static napi_value WriteVt(napi_env env, napi_callback_info info) {
   size_t len;
   NAPI_CALL(env, napi_get_buffer_info(env, argv[1], &data, &len));
   ghostty_terminal_vt_write(s->terminal, (const uint8_t *)data, len);
+
+  // Hand any query responses (CPR/DA/…) generated during this write back to
+  // the caller, who forwards them to the PTY.
+  if (s->resp_len > 0) {
+    napi_value buf;
+    void *out;
+    NAPI_CALL(env, napi_create_buffer_copy(env, s->resp_len, s->resp, &out, &buf));
+    s->resp_len = 0;
+    return buf;
+  }
   return NULL;
 }
 

@@ -71,6 +71,13 @@ typedef struct {
   // Host-driven blink phase: when set, render() skips the cursor.
   bool cursor_hidden;
 
+  // Query responses (DSR/CPR/DA/…) generated during vt_write, buffered here
+  // by the write_pty effect and returned to JS from write() so the host can
+  // feed them back to the PTY. Without this, ncurses apps stall waiting for
+  // answers (htop's multi-second blank startup).
+  uint8_t *resp;
+  size_t resp_len, resp_cap;
+
 #ifdef __APPLE__
   IOSurfaceRef surfaces[2];
   int surface_index;
