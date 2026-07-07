@@ -91,19 +91,9 @@ jobs:
           # Explicit msvc ABI: zig's default gnu-ABI objects break link.exe's
           # default-CRT resolution (unresolved malloc/calloc everywhere).
           zig build -Demit-lib-vt=true -Doptimize=ReleaseFast -Dtarget=x86_64-windows-msvc
-          cd zig-out/lib
-          # node-gyp links ghostty-vt.lib; zig may emit the unix archive name.
-          if [ -f libghostty-vt.a ] && [ ! -f ghostty-vt.lib ]; then
-            cp libghostty-vt.a ghostty-vt.lib
-          fi
-          ls -la
-
-      - name: Inspect zig archive directives (diagnostics)
-        shell: pwsh
-        run: |
-          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          & $dumpbin /DIRECTIVES vendor/ghostty/zig-out/lib/ghostty-vt.lib | Select-String -Pattern "defaultlib|nodefault" | Sort-Object -Unique | Select-Object -First 20
+          # zig installs ghostty-vt.lib (DLL import lib) AND
+          # ghostty-vt-static.lib (the static archive we link).
+          ls -la zig-out/lib
 
       - name: Build native addon (VT core + stub platform layer)
         run: npm run build:native

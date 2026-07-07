@@ -22,7 +22,7 @@
         ["OS=='win'", {
           "sources": ["src/producer_stub.c"],
           "libraries": [
-            "<(module_root_dir)/../vendor/ghostty/zig-out/lib/ghostty-vt.lib",
+            "<(module_root_dir)/../vendor/ghostty/zig-out/lib/ghostty-vt-static.lib",
             "libcmt.lib",
             "libucrt.lib",
             "libvcruntime.lib"
