@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>xterm.js WebGL baseline</title>
+  <style>body { margin: 0; background: #1e1e1e; }</style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script>
+    const { ipcRenderer } = require('electron');
+    const fs = require('fs');
+    const path = require('path');
+
+    const link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = path.join(__dirname, '..', 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css');
+    document.head.appendChild(link);
+
+    const { Terminal } = require('@xterm/xterm');
+    const { WebglAddon } = require('@xterm/addon-webgl');
+
+    const term = new Terminal({ cols: 120, rows: 30, scrollback: 1000 });
+    term.open(document.getElementById('terminal'));
+    const webgl = new WebglAddon();
+    term.loadAddon(webgl);
+    webgl.onContextLoss(() => ipcRenderer.send('bench-error', 'WebGL context lost'));
+
+    let frames = 0;
+    term.onRender(() => frames++);
+
+    const CHUNK_SIZE = 64 * 1024;
+
+    ipcRenderer.on('start', async (event, payloadPath) => {
+      try {
+        const data = fs.readFileSync(payloadPath, 'latin1');
+        const t0 = performance.now();
+
+        for (let off = 0; off < data.length; off += CHUNK_SIZE) {
+          const chunk = data.slice(off, off + CHUNK_SIZE);
+          await new Promise(resolve => term.write(chunk, resolve));
+        }
+        const parseMs = performance.now() - t0;
+
+        // Wait for the final frame to actually be presented: one rAF lets the
+        // renderer draw pending damage, the second guarantees the previous
+        // frame reached the compositor.
+        await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
+        const e2eMs = performance.now() - t0;
+
+        ipcRenderer.send('done', {
+          payloadBytes: data.length,
+          parseMs,
+          e2eMs,
+          frames,
+          throughputMBps: (data.length / (1024 * 1024)) / (e2eMs / 1000),
+          cols: term.cols,
+          rows: term.rows
+        });
+      } catch (err) {
+        ipcRenderer.send('bench-error', err.message + '\n' + err.stack);
+      }
+    });
+
+    // Signal ready only after the compositor has presented the initial page,
+    // so benchmark timing doesn't include first-paint warm-up.
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      ipcRenderer.send('ready');
+    }));
+  </script>
+</body>
+</html>
