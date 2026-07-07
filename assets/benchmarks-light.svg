@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="360" viewBox="0 0 760 360" role="img" aria-label="Benchmark comparison of xterm.js and libghostty in Electron">
+<text x="24" y="24" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="15" font-weight="600" fill="#1f2328">xterm.js vs libghostty, both inside Electron</text>
+<text x="24" y="42" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#59636e">macOS, Apple Silicon @2x — same payloads, same grid, presentation-confirmed finish lines</text>
+<rect x="550" y="14" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="566" y="23" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">xterm.js + WebGL</text>
+<rect x="550" y="32" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="566" y="41" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">libghostty + sharedTexture</text>
+<text x="24" y="68" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328">VT parser throughput</text>
+<text x="24" y="83" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#59636e">MB/s · higher is better</text>
+<path d="M24 90 h35.411764705882355 a4 4 0 0 1 4 4 v5 a4 4 0 0 1 -4 4 h-35.411764705882355 z" fill="#2a78d6"/>
+<text x="71.41176470588235" y="100" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">20.1 MB/s</text>
+<path d="M24 105 h426 a4 4 0 0 1 4 4 v5 a4 4 0 0 1 -4 4 h-426 z" fill="#1baf7a"/>
+<text x="462" y="115" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">219.3 MB/s</text>
+<text x="736" y="105" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" text-anchor="end" fill="#1f2328">11×</text>
+<text x="24" y="142" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328">10 MiB output flood, in-terminal</text>
+<text x="24" y="157" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#59636e">ms to final frame · lower is better</text>
+<path d="M24 164 h426 a4 4 0 0 1 4 4 v5 a4 4 0 0 1 -4 4 h-426 z" fill="#2a78d6"/>
+<text x="462" y="174" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">1183 ms</text>
+<path d="M24 179 h19.626373626373628 a4 4 0 0 1 4 4 v5 a4 4 0 0 1 -4 4 h-19.626373626373628 z" fill="#1baf7a"/>
+<text x="55.62637362637363" y="189" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">65 ms</text>
+<text x="736" y="179" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" text-anchor="end" fill="#1f2328">18×</text>
+<text x="24" y="216" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328">cat a 1 GiB file in a real shell (PTY)</text>
+<text x="24" y="231" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#59636e">seconds · lower is better</text>
+<path d="M24 238 h426 a4 4 0 0 1 4 4 v5 a4 4 0 0 1 -4 4 h-426 z" fill="#2a78d6"/>
+<text x="462" y="248" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">54.9 s</text>
+<path d="M24 253 h188.67759562841533 a4 4 0 0 1 4 4 v5 a4 4 0 0 1 -4 4 h-188.67759562841533 z" fill="#1baf7a"/>
+<text x="224.67759562841533" y="263" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">24.6 s</text>
+<text x="736" y="253" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" text-anchor="end" fill="#1f2328">2.2×</text>
+<text x="24" y="290" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="13" font-weight="600" fill="#1f2328">Ctrl+C response mid-flood</text>
+<text x="24" y="305" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="11" fill="#59636e">ms until prompt is back · lower is better</text>
+<path d="M24 312 h426 a4 4 0 0 1 4 4 v5 a4 4 0 0 1 -4 4 h-426 z" fill="#2a78d6"/>
+<text x="462" y="322" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">1007 ms</text>
+<path d="M24 327 h16.496524329692157 a4 4 0 0 1 4 4 v5 a4 4 0 0 1 -4 4 h-16.496524329692157 z" fill="#1baf7a"/>
+<text x="52.49652432969216" y="337" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="12" fill="#1f2328">48 ms</text>
+<text x="736" y="327" font-family="-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="14" font-weight="600" text-anchor="end" fill="#1f2328">21×</text>
+</svg>

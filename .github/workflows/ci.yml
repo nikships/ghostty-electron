@@ -62,7 +62,9 @@ jobs:
 
   windows:
     name: Windows (parser + xterm baseline)
-    runs-on: windows-latest
+    # windows-latest ships Visual Studio "18", which node-gyp (≤11.x) cannot
+    # identify; windows-2022 carries VS2022 which it handles fine.
+    runs-on: windows-2022
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
