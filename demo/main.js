@@ -251,21 +251,26 @@ app.whenReady().then(async () => {
   /* ─── smoke mode for integration tests ─────────────────────────────── */
   if (SMOKE) {
     const MARKER = 'SMOKE_' + 6 * 7 + '_OK';
+    const isEcho = (l) => l.includes(MARKER) && !l.includes('echo');
     setTimeout(() => {
       ptyG.write(`echo ${MARKER}\r`);
       ptyX.write(`echo ${MARKER}\r`);
-    }, 1200);
+    }, 1500);
 
-    setTimeout(async () => {
-      const ghosttyLines = addon.getText(term.session);
-      const ghosttyEcho = ghosttyLines.some((l) => l.includes(MARKER) && !l.includes('echo'));
+    // Poll until both grids show the echo — fixed short deadlines flake on
+    // slow CI VMs (shell spawn + first paint can take several seconds).
+    const deadline = Date.now() + 25_000;
+    let xtermLines = [];
+    ipcMain.on('x-text', (event, lines) => { xtermLines = lines; });
 
-      const xtermText = await new Promise((resolve) => {
-        ipcMain.once('x-text', (event, lines) => resolve(lines));
-        xtermWin.webContents.send('x-get-text');
-        setTimeout(() => resolve([]), 2000);
-      });
-      const xtermEcho = xtermText.some((l) => l.includes(MARKER) && !l.includes('echo'));
+    const poll = setInterval(async () => {
+      let ghosttyEcho = false;
+      try { ghosttyEcho = addon.getText(term.session).some(isEcho); } catch {}
+      const xtermEcho = xtermLines.some(isEcho);
+      if (!xtermWin.isDestroyed()) xtermWin.webContents.send('x-get-text');
+
+      if (!(ghosttyEcho && xtermEcho) && Date.now() < deadline) return;
+      clearInterval(poll);
 
       const resultsDir = path.join(__dirname, '..', 'results');
       fs.mkdirSync(resultsDir, { recursive: true });
@@ -280,7 +285,7 @@ app.whenReady().then(async () => {
 
       console.log(JSON.stringify({ ghosttyEcho, xtermEcho }));
       app.exit(ghosttyEcho && xtermEcho ? 0 : 1);
-    }, 4000);
+    }, 500);
   }
 });
 
