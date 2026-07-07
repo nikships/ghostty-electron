@@ -60,9 +60,15 @@ app.whenReady().then(async () => {
   });
 
   // Present loop: ~120Hz dirty checks; render() returns null when clean so
-  // idle cost is a render_state_update. One transfer in flight at a time.
+  // idle cost is a render_state_update. One transfer in flight at a time,
+  // and an IOSurface is only redrawn after the consumer ACKED the last frame
+  // that used it — otherwise we'd repaint a surface the compositor is still
+  // reading and the user sees torn/blended frames under fast TUI updates.
   let sendBusy = false;
   let seq = 0;
+  let maxAckedSeq = 0;
+  let lastSurfaceIndex = 0;
+  const surfaceSeq = [0, 0]; // last seq presented from each IOSurface
   let framesThisSecond = 0;
   let fps = 0;
   let renderMsLast = 0;
@@ -73,14 +79,19 @@ app.whenReady().then(async () => {
 
   async function presentTick() {
     if (sendBusy || ghosttyWin.isDestroyed()) return;
+    // render() flips to the other surface; skip until its last frame is acked.
+    const nextIndex = 1 - lastSurfaceIndex;
+    if (surfaceSeq[nextIndex] > maxAckedSeq) return;
     let frame;
     try {
       frame = addon.render(term.session);
     } catch { return; }
     if (!frame) return;
     renderMsLast = frame.renderMs;
+    lastSurfaceIndex = frame.surfaceIndex;
     sendBusy = true;
     seq++;
+    surfaceSeq[frame.surfaceIndex] = seq;
     pendingSends.set(seq, performance.now());
     try {
       const imported = sharedTexture.importSharedTexture({
@@ -105,6 +116,7 @@ app.whenReady().then(async () => {
   const presentTimer = setInterval(presentTick, 8);
 
   ipcMain.on('frame-presented', (event, ack) => {
+    maxAckedSeq = Math.max(maxAckedSeq, ack.seq);
     const sent = pendingSends.get(ack.seq);
     if (sent !== undefined) {
       const latency = performance.now() - sent;
@@ -128,10 +140,23 @@ app.whenReady().then(async () => {
   }, 500);
 
   ipcMain.on('renderer-ready', () => {
-    ghosttyWin.webContents.send('init', { cssWidth: cssW, cssHeight: cssH });
+    ghosttyWin.webContents.send('init', {
+      cssWidth: cssW,
+      cssHeight: cssH,
+      cellWidth: term.cellWidth / scale,
+      cellHeight: term.cellHeight / scale
+    });
   });
 
+  let hasSelection = false;
+  function clearSelection() {
+    if (!hasSelection) return;
+    hasSelection = false;
+    try { addon.clearSelection(term.session); } catch {}
+  }
+
   ipcMain.on('g-key', (event, ev) => {
+    clearSelection();
     try {
       const bytes = addon.encodeKey(term.session, ev);
       if (bytes.length > 0) ptyG.write(bytes.toString('binary'));
@@ -141,6 +166,36 @@ app.whenReady().then(async () => {
   ipcMain.on('g-paste', () => {
     const text = clipboard.readText();
     if (text) ptyG.write(text);
+  });
+
+  // Mouse selection: anchor on mousedown, extend on drag, keep on mouseup.
+  let selAnchor = null;
+  ipcMain.on('g-sel', (event, { phase, x, y }) => {
+    const cx = Math.max(0, Math.min(COLS - 1, x));
+    const cy = Math.max(0, Math.min(ROWS - 1, y));
+    if (phase === 'start') {
+      selAnchor = { x: cx, y: cy };
+      clearSelection();
+    } else if (selAnchor && (phase === 'drag' || phase === 'end')) {
+      if (phase === 'end' && cx === selAnchor.x && cy === selAnchor.y && !hasSelection) {
+        clearSelection(); // click without drag
+        return;
+      }
+      // Order anchor/point so start ≤ end (backward drags).
+      let [s0, s1] = [selAnchor, { x: cx, y: cy }];
+      if (s1.y < s0.y || (s1.y === s0.y && s1.x < s0.x)) [s0, s1] = [s1, s0];
+      try {
+        addon.setSelection(term.session, s0.x, s0.y, s1.x, s1.y);
+        hasSelection = true;
+      } catch {}
+    }
+  });
+
+  ipcMain.on('g-copy', () => {
+    try {
+      const text = addon.getSelectionText(term.session);
+      if (text) clipboard.writeText(text);
+    } catch {}
   });
 
   let scrollRemainder = 0;

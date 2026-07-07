@@ -174,6 +174,105 @@ test('wide characters occupy two cells', () => {
   assert.strictEqual(cur.x, 4, 'two wide chars advance cursor by 4');
 });
 
+test('incremental rendering is pixel-identical to a full redraw', () => {
+  // Any divergence means a frame depends on redraw history instead of grid
+  // state — the bug class behind corrupted TUIs (glyph bleed, dirty misses).
+  const COLS = 60, ROWS = 10;
+  const scenarios = {
+    scroll: Array.from({ length: 30 }, (_, i) => `scroll line ${i}\r\n`),
+    spinner: Array.from({ length: 20 }, (_, i) => `\x1b[5;10H(${i % 10}s . ${i * 7} tokens)`),
+    'altscreen-tui': [
+      '\x1b[?1049h\x1b[2J\x1b[H',
+      '\x1b[1;1H╭' + '─'.repeat(COLS - 2) + '╮',
+      ...Array.from({ length: ROWS - 2 }, (_, i) => `\x1b[${i + 2};1H│\x1b[${i + 2};${COLS}H│`),
+      `\x1b[${ROWS};1H╰` + '─'.repeat(COLS - 2) + '╯',
+      ...Array.from({ length: 15 }, (_, i) => `\x1b[3;20H(${i}s . ${i * 13} tokens)   `),
+      '\x1b[5;5H\x1b[Kupdated content here'
+    ],
+    'erase-rewrite': ['a\r\nb\r\nc\r\n', '\x1b[2;1H\x1b[2Kreplaced\x1b[1;1H', '\x1b[2J\x1b[Hfresh\r\n'],
+    'scroll-region': ['\x1b[1;8r\x1b[8;1H', ...Array.from({ length: 20 }, (_, i) => `region ${i}\r\n`), '\x1b[r\x1b[10;1Hstatus']
+  };
+
+  for (const [name, bursts] of Object.entries(scenarios)) {
+    const inc = addon.create(COLS, ROWS, 13, 1);
+    let all = '';
+    for (const b of bursts) {
+      all += b;
+      addon.write(inc.session, Buffer.from(b, 'utf8'));
+      addon.render(inc.session);
+    }
+    addon.render(inc.session);
+
+    const ref = addon.create(COLS, ROWS, 13, 1);
+    addon.write(ref.session, Buffer.from(all, 'utf8'));
+    addon.render(ref.session);
+
+    const a = addon.readPixels(inc.session);
+    const b = addon.readPixels(ref.session);
+    assert.deepStrictEqual(a.data.equals(b.data), true, `${name}: incremental != full redraw`);
+  }
+});
+
+test('box drawing renders as geometry (aligned lines)', () => {
+  const t = makeTerm();
+  write(t, '─│█');
+  addon.render(t.session);
+  const px = addon.readPixels(t.session);
+  const cw = Math.round(t.cellWidth), ch = Math.round(t.cellHeight);
+  const isFg = (r, g, b) => r > 120 && g > 120 && b > 120;
+
+  // '─' paints the middle row of cell 0 edge-to-edge, nothing at the top.
+  const midRow = Math.floor(ch / 2);
+  let mid = 0, top = 0;
+  for (let x = 0; x < cw; x++) {
+    let i = (midRow * px.width + x) * 4;
+    if (isFg(px.data[i + 2], px.data[i + 1], px.data[i])) mid++;
+    i = (1 * px.width + x) * 4;
+    if (isFg(px.data[i + 2], px.data[i + 1], px.data[i])) top++;
+  }
+  assert.strictEqual(mid, cw, 'horizontal line spans full cell width');
+  assert.strictEqual(top, 0, 'no pixels at cell top');
+
+  // '│' spans the full cell height at cell 1's center column.
+  const centerX = cw + Math.floor(cw / 2);
+  let vert = 0;
+  for (let y = 0; y < ch; y++) {
+    const i = (y * px.width + centerX) * 4;
+    if (isFg(px.data[i + 2], px.data[i + 1], px.data[i])) vert++;
+  }
+  assert.strictEqual(vert, ch, 'vertical line spans full cell height');
+
+  // '█' fills cell 2 completely.
+  const full = countPixels(t, px, 2, 0, isFg);
+  assert.strictEqual(full, cw * ch, 'full block fills the cell');
+});
+
+test('selection: set, render inverted, extract text, clear', () => {
+  const t = makeTerm();
+  write(t, 'hello world\r\nsecond line');
+
+  addon.setSelection(t.session, 0, 0, 4, 0); // "hello"
+  assert.strictEqual(addon.getSelectionText(t.session), 'hello');
+
+  addon.render(t.session);
+  const px = addon.readPixels(t.session);
+  // Selected cell bg becomes the (bright) foreground color.
+  const cellArea = Math.round(t.cellWidth) * Math.round(t.cellHeight);
+  const bright = countPixels(t, px, 1, 0, (r, g, b) => r > 120 && g > 120 && b > 120);
+  assert.ok(bright > cellArea * 0.5, `selected cell is inverted (${bright}/${cellArea})`);
+  const outside = countPixels(t, px, 6, 0, (r, g, b) => r > 120 && g > 120 && b > 120);
+  assert.ok(outside < cellArea * 0.5, 'unselected cell is not inverted');
+
+  // Multi-row selection.
+  addon.setSelection(t.session, 6, 0, 5, 1);
+  assert.strictEqual(addon.getSelectionText(t.session), 'world\nsecond');
+
+  addon.clearSelection(t.session);
+  assert.strictEqual(addon.getSelectionText(t.session), null);
+  const f = addon.render(t.session);
+  assert.ok(f, 'clearing selection re-renders');
+});
+
 test('key encoding: printables and control keys', () => {
   const t = makeTerm();
   const enc = (ev) => addon.encodeKey(t.session, ev).toString('latin1');

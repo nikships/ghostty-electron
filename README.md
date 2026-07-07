@@ -68,7 +68,9 @@ yes | head -1000000
 vim / less / htop           # arrows work via mode-aware key encoding (DECCKM)
 ```
 
-Scroll wheel scrolls ghostty's real scrollback; Cmd+V pastes.
+Scroll wheel scrolls ghostty's real scrollback; mouse-drag selects (rendered
+inverted, extracted via ghostty's formatter API); Cmd+C copies the selection;
+Cmd+V pastes.
 
 ## Architecture
 
@@ -85,13 +87,19 @@ ghostty path:     PTY ──▶ libghostty-vt (main proc, native) ──▶ Core
 The ghostty-side renderer implements: fg/bg colors (palette + truecolor),
 bold (incl. bold-in-bright-colors), italic, inverse, faint, underline,
 strikethrough, wide chars/graphemes (CJK, emoji), cursor (block/bar/underline/
-hollow), scrollback viewport, resize, HiDPI, double-buffered IOSurfaces with
-dirty-row-only redraws. The renderer stays fully **sandboxed** — no native code
-in the renderer; it only receives a GPU texture handle per frame.
+hollow), **geometric box-drawing/block/braille glyphs** (font fallback
+misaligns these ranges — every terminal custom-draws them), mouse selection
+with copy, scrollback viewport, resize, HiDPI, double-buffered IOSurfaces with
+dirty-row-only redraws (row draws are clipped, and incremental output is
+test-enforced to be pixel-identical to a full redraw). The renderer stays
+fully **sandboxed** — no native code in the renderer; it only receives a GPU
+texture handle per frame. The demo additionally gates IOSurface reuse on
+consumer acks so a surface is never repainted while the compositor may still
+be reading it.
 
-**Non-goals (so far):** mouse selection/copy, links, search, IME composition,
-ligatures, kitty graphics, blinking cursor. None of these affect the parse/
-present numbers above.
+**Non-goals (so far):** links, search, IME composition, ligatures, kitty
+graphics, blinking cursor. None of these affect the parse/present numbers
+above.
 
 ## Run it
 

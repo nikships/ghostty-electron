@@ -30,10 +30,15 @@ sharedTexture.setSharedTextureReceiver(async (data, meta) => {
   }
 });
 
-ipcRenderer.on('init', (event, { cssWidth, cssHeight }) => {
+let cellW = 8, cellH = 16;
+
+ipcRenderer.on('init', (event, { cssWidth, cssHeight, cellWidth, cellHeight }) => {
   const canvas = document.getElementById('terminal-canvas');
   canvas.style.width = cssWidth + 'px';
   canvas.style.height = cssHeight + 'px';
+  canvas.style.cursor = 'text';
+  cellW = cellWidth;
+  cellH = cellHeight;
   canvas.focus();
 });
 
@@ -55,11 +60,15 @@ window.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('keydown', (e) => {
     if (MODIFIER_KEYS.has(e.key)) return;
 
-    // Cmd+V pastes; other Cmd shortcuts (Q, W, C, …) stay with the browser.
+    // Cmd+V pastes, Cmd+C copies the selection; other Cmd shortcuts
+    // (Q, W, …) stay with the browser.
     if (e.metaKey) {
       if (e.code === 'KeyV') {
         e.preventDefault();
         ipcRenderer.send('g-paste');
+      } else if (e.code === 'KeyC') {
+        e.preventDefault();
+        ipcRenderer.send('g-copy');
       }
       return;
     }
@@ -79,4 +88,29 @@ window.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('wheel', (e) => {
     ipcRenderer.send('g-wheel', { deltaY: e.deltaY });
   }, { passive: true });
+
+  // Mouse selection: report cell coordinates; main drives the ghostty
+  // selection API and re-renders with the range inverted.
+  const canvas = document.getElementById('terminal-canvas');
+  let dragging = false;
+  const cellOf = (e) => {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: Math.floor((e.clientX - rect.left) / cellW),
+      y: Math.floor((e.clientY - rect.top) / cellH)
+    };
+  };
+  canvas.addEventListener('mousedown', (e) => {
+    if (e.button !== 0) return;
+    dragging = true;
+    ipcRenderer.send('g-sel', { phase: 'start', ...cellOf(e) });
+  });
+  window.addEventListener('mousemove', (e) => {
+    if (dragging) ipcRenderer.send('g-sel', { phase: 'drag', ...cellOf(e) });
+  });
+  window.addEventListener('mouseup', (e) => {
+    if (!dragging) return;
+    dragging = false;
+    ipcRenderer.send('g-sel', { phase: 'end', ...cellOf(e) });
+  });
 });

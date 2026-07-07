@@ -92,11 +92,27 @@ typedef struct {
   char utf8[16];
   uint8_t utf8_len;   // 0 = empty cell
   bool is_ascii;      // single printable ASCII byte
+  uint32_t cp;        // first codepoint (0 = none)
   GhosttyColorRgb fg;
   GhosttyColorRgb bg;
   bool has_bg;
   bool bold, italic, underline, strikethrough;
 } CellSnap;
+
+static uint32_t utf8_first_cp(const char *s, uint8_t len) {
+  const uint8_t *b = (const uint8_t *)s;
+  if (len == 0) return 0;
+  if (b[0] < 0x80) return b[0];
+  if ((b[0] & 0xE0) == 0xC0 && len >= 2)
+    return ((uint32_t)(b[0] & 0x1F) << 6) | (b[1] & 0x3F);
+  if ((b[0] & 0xF0) == 0xE0 && len >= 3)
+    return ((uint32_t)(b[0] & 0x0F) << 12) | ((uint32_t)(b[1] & 0x3F) << 6) |
+           (b[2] & 0x3F);
+  if ((b[0] & 0xF8) == 0xF0 && len >= 4)
+    return ((uint32_t)(b[0] & 0x07) << 18) | ((uint32_t)(b[1] & 0x3F) << 12) |
+           ((uint32_t)(b[2] & 0x3F) << 6) | (b[3] & 0x3F);
+  return 0;
+}
 
 /** Wide property of the row-cells iterator's current cell. */
 static GhosttyCellWide current_cell_wide(Session *s) {
@@ -270,6 +286,7 @@ static int snapshot_row(Session *s, const GhosttyRenderStateColors *colors,
         snap->utf8_len = (uint8_t)buf.len;
         snap->is_ascii = buf.len == 1 && snap->utf8[0] >= 0x20 &&
                          snap->utf8[0] <= 0x7E;
+        snap->cp = utf8_first_cp(snap->utf8, snap->utf8_len);
       }
     }
 
@@ -320,11 +337,133 @@ static int snapshot_row(Session *s, const GhosttyRenderStateColors *colors,
     memset(&snaps[col], 0, sizeof(CellSnap));
     snaps[col].fg = colors->foreground;
   }
+
+  // Selection highlight: invert fg/bg for the row-local selected range.
+  GhosttyRenderStateRowSelection sel =
+      GHOSTTY_INIT_SIZED(GhosttyRenderStateRowSelection);
+  if (ghostty_render_state_row_get(s->row_iter,
+                                   GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION,
+                                   &sel) == GHOSTTY_SUCCESS) {
+    for (int c = sel.start_x; c <= sel.end_x && c < s->cols; c++) {
+      GhosttyColorRgb fg = snaps[c].fg;
+      snaps[c].fg = snaps[c].has_bg ? snaps[c].bg : colors->background;
+      snaps[c].bg = fg;
+      snaps[c].has_bg = true;
+    }
+  }
   return s->cols;
 }
 
 static bool rgb_eq(GhosttyColorRgb a, GhosttyColorRgb b) {
   return a.r == b.r && a.g == b.g && a.b == b.b;
+}
+
+/* ── Geometric glyphs ─────────────────────────────────────────────────────
+ * Box drawing, block elements, and braille are drawn as geometry instead of
+ * font glyphs: font fallback misplaces them (wrong baseline/advance), which
+ * wrecks TUI borders, and glyph bleed breaks partial-row redraws. Terminals
+ * (including ghostty itself) custom-draw these ranges for exactly this
+ * reason. Returns true when the codepoint was handled. */
+
+enum { BOX_U = 1, BOX_D = 2, BOX_L = 4, BOX_R = 8, BOX_HEAVY = 16 };
+
+static int box_flags(uint32_t cp) {
+  switch (cp) {
+    case 0x2500: case 0x2550: return BOX_L | BOX_R;
+    case 0x2501: return BOX_L | BOX_R | BOX_HEAVY;
+    case 0x2502: case 0x2551: return BOX_U | BOX_D;
+    case 0x2503: return BOX_U | BOX_D | BOX_HEAVY;
+    case 0x250C: case 0x2554: case 0x256D: return BOX_D | BOX_R;
+    case 0x2510: case 0x2557: case 0x256E: return BOX_D | BOX_L;
+    case 0x2514: case 0x255A: case 0x2570: return BOX_U | BOX_R;
+    case 0x2518: case 0x255D: case 0x256F: return BOX_U | BOX_L;
+    case 0x251C: case 0x2560: return BOX_U | BOX_D | BOX_R;
+    case 0x2524: case 0x2563: return BOX_U | BOX_D | BOX_L;
+    case 0x252C: case 0x2566: return BOX_D | BOX_L | BOX_R;
+    case 0x2534: case 0x2569: return BOX_U | BOX_L | BOX_R;
+    case 0x253C: case 0x256C: return BOX_U | BOX_D | BOX_L | BOX_R;
+    case 0x2574: return BOX_L;
+    case 0x2575: return BOX_U;
+    case 0x2576: return BOX_R;
+    case 0x2577: return BOX_D;
+    default: return 0;
+  }
+}
+
+static bool draw_geometric_cell(CGContextRef ctx, uint32_t cp,
+                                GhosttyColorRgb fg, double x, double cg_y,
+                                double w, double h, double scale) {
+  // Box drawing U+2500–U+257F (common subset; doubles drawn as singles).
+  int flags = cp >= 0x2500 && cp <= 0x257F ? box_flags(cp) : 0;
+  if (flags) {
+    set_fill_rgb(ctx, fg);
+    double t = fmax(1.0, round(scale));
+    if (flags & BOX_HEAVY) t *= 2;
+    double xc = x + w / 2 - t / 2;
+    double yc = cg_y + h / 2 - t / 2;
+    if (flags & BOX_L) CGContextFillRect(ctx, CGRectMake(x, yc, xc - x + t, t));
+    if (flags & BOX_R) CGContextFillRect(ctx, CGRectMake(xc, yc, x + w - xc, t));
+    // Screen "up" is +y in CG's bottom-up space.
+    if (flags & BOX_U) CGContextFillRect(ctx, CGRectMake(xc, yc, t, cg_y + h - yc));
+    if (flags & BOX_D) CGContextFillRect(ctx, CGRectMake(xc, cg_y, t, yc - cg_y + t));
+    return true;
+  }
+
+  // Block elements U+2580–U+259F.
+  if (cp >= 0x2580 && cp <= 0x259F) {
+    set_fill_rgb(ctx, fg);
+    if (cp == 0x2580) { CGContextFillRect(ctx, CGRectMake(x, cg_y + h / 2, w, h / 2)); return true; }
+    if (cp >= 0x2581 && cp <= 0x2588) { // lower eighths
+      double k = (cp - 0x2580) / 8.0;
+      CGContextFillRect(ctx, CGRectMake(x, cg_y, w, h * k));
+      return true;
+    }
+    if (cp >= 0x2589 && cp <= 0x258F) { // left eighths
+      double k = (8 - (cp - 0x2588)) / 8.0;
+      CGContextFillRect(ctx, CGRectMake(x, cg_y, w * k, h));
+      return true;
+    }
+    if (cp == 0x2590) { CGContextFillRect(ctx, CGRectMake(x + w / 2, cg_y, w / 2, h)); return true; }
+    if (cp >= 0x2591 && cp <= 0x2593) { // shades
+      double alpha = (cp - 0x2590) * 0.25;
+      CGContextSetRGBFillColor(ctx, fg.r / 255.0, fg.g / 255.0, fg.b / 255.0, alpha);
+      CGContextFillRect(ctx, CGRectMake(x, cg_y, w, h));
+      return true;
+    }
+    if (cp == 0x2594) { CGContextFillRect(ctx, CGRectMake(x, cg_y + h * 7 / 8, w, h / 8)); return true; }
+    if (cp == 0x2595) { CGContextFillRect(ctx, CGRectMake(x + w * 7 / 8, cg_y, w / 8, h)); return true; }
+    // Quadrants: bit 0=UL, 1=UR, 2=LL, 3=LR.
+    static const uint8_t QUAD[10] = {
+        /*2596 ▖*/ 4, /*2597 ▗*/ 8, /*2598 ▘*/ 1, /*2599 ▙*/ 13,
+        /*259A ▚*/ 9, /*259B ▛*/ 7, /*259C ▜*/ 11, /*259D ▝*/ 2,
+        /*259E ▞*/ 6, /*259F ▟*/ 14};
+    uint8_t q = QUAD[cp - 0x2596];
+    if (q & 1) CGContextFillRect(ctx, CGRectMake(x, cg_y + h / 2, w / 2, h / 2));
+    if (q & 2) CGContextFillRect(ctx, CGRectMake(x + w / 2, cg_y + h / 2, w / 2, h / 2));
+    if (q & 4) CGContextFillRect(ctx, CGRectMake(x, cg_y, w / 2, h / 2));
+    if (q & 8) CGContextFillRect(ctx, CGRectMake(x + w / 2, cg_y, w / 2, h / 2));
+    return true;
+  }
+
+  // Braille U+2800–U+28FF: 2×4 dot matrix.
+  if (cp >= 0x2800 && cp <= 0x28FF) {
+    set_fill_rgb(ctx, fg);
+    uint32_t bits = cp - 0x2800;
+    // (col,row) for bits 0..7: dots 1,2,3 = col0 rows0-2; 4,5,6 = col1
+    // rows0-2; 7 = col0 row3; 8 = col1 row3.
+    static const uint8_t DOT_COL[8] = {0, 0, 0, 1, 1, 1, 0, 1};
+    static const uint8_t DOT_ROW[8] = {0, 1, 2, 0, 1, 2, 3, 3};
+    double r = fmax(scale, fmin(w, h / 2) * 0.18);
+    for (int i = 0; i < 8; i++) {
+      if (!(bits & (1u << i))) continue;
+      double cx = x + w * (DOT_COL[i] ? 0.72 : 0.28);
+      double cy = cg_y + h * (1.0 - (DOT_ROW[i] + 0.5) / 4.0);
+      CGContextFillEllipseInRect(ctx, CGRectMake(cx - r, cy - r, 2 * r, 2 * r));
+    }
+    return true;
+  }
+
+  return false;
 }
 
 static int font_variant(const CellSnap *c) {
@@ -343,6 +482,12 @@ static void draw_row(Session *s, CGContextRef ctx, int row_index,
   double y_top = row_index * s->cell_h;              // top-down pixel space
   double cg_y = s->px_h - y_top - s->cell_h;         // CG is bottom-up
   double baseline = s->px_h - y_top - s->ascent;
+
+  // Clip to the row rect: glyphs (esp. via font fallback) can bleed outside
+  // their line box, and with partial-row redraws any bleed makes the frame
+  // depend on redraw history instead of grid state alone.
+  CGContextSaveGState(ctx);
+  CGContextClipToRect(ctx, CGRectMake(0, cg_y, s->px_w, s->cell_h));
 
   // Row background: default fill, then runs of non-default bg.
   set_fill_rgb(ctx, colors->background);
@@ -394,6 +539,10 @@ static void draw_row(Session *s, CGContextRef ctx, int row_index,
       run_len++;
     } else {
       FLUSH_RUN();
+      // Box drawing / block elements / braille → geometry, not font glyphs.
+      if (draw_geometric_cell(ctx, snap->cp, snap->fg, c * s->cell_w, cg_y,
+                              s->cell_w, s->cell_h, s->scale))
+        continue;
       // Non-ASCII: CTLine per cell (handles CJK, emoji, graphemes).
       CFStringRef str = CFStringCreateWithBytes(
           NULL, (const UInt8 *)snap->utf8, snap->utf8_len,
@@ -478,6 +627,8 @@ static void draw_row(Session *s, CGContextRef ctx, int row_index,
       }
     }
   }
+
+  CGContextRestoreGState(ctx);  // row clip
 }
 
 /* ── N-API: create ────────────────────────────────────────────────────── */
@@ -708,6 +859,111 @@ static napi_value Render(napi_env env, napi_callback_info info) {
   NAPI_CALL(env, napi_set_named_property(env, result, "rowsDrawn", v));
   NAPI_CALL(env, napi_create_double(env, render_ms, &v));
   NAPI_CALL(env, napi_set_named_property(env, result, "renderMs", v));
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)s->surface_index, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "surfaceIndex", v));
+  return result;
+}
+
+/* ── N-API: selection ─────────────────────────────────────────────────── */
+
+static void dirty_all_rows(Session *s) {
+  s->mod_seq++;
+  for (uint16_t i = 0; i < s->rows; i++) s->row_modified[i] = s->mod_seq;
+  s->needs_present = true;
+}
+
+/** setSelection(session, startX, startY, endX, endY) — viewport cell coords, end inclusive. */
+static napi_value SetSelection(napi_env env, napi_callback_info info) {
+  size_t argc = 5;
+  napi_value argv[5];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 5, "setSelection(session, sx, sy, ex, ey)");
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  uint32_t coords[4];
+  for (int i = 0; i < 4; i++)
+    NAPI_CALL(env, napi_get_value_uint32(env, argv[i + 1], &coords[i]));
+
+  GhosttyGridRef refs[2];
+  for (int i = 0; i < 2; i++) {
+    refs[i] = (GhosttyGridRef)GHOSTTY_INIT_SIZED(GhosttyGridRef);
+    GhosttyPoint pt = {
+        .tag = GHOSTTY_POINT_TAG_VIEWPORT,
+        .value = {.coordinate = {.x = (uint16_t)coords[i * 2],
+                                 .y = (uint16_t)coords[i * 2 + 1]}},
+    };
+    THROW_IF(env,
+             ghostty_terminal_grid_ref(s->terminal, pt, &refs[i]) !=
+                 GHOSTTY_SUCCESS,
+             "grid_ref failed");
+  }
+
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  sel.start = refs[0];
+  sel.end = refs[1];
+  THROW_IF(env,
+           ghostty_terminal_set(s->terminal, GHOSTTY_TERMINAL_OPT_SELECTION,
+                                &sel) != GHOSTTY_SUCCESS,
+           "set selection failed");
+  dirty_all_rows(s);
+  return NULL;
+}
+
+/** clearSelection(session) */
+static napi_value ClearSelection(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  ghostty_terminal_set(s->terminal, GHOSTTY_TERMINAL_OPT_SELECTION, NULL);
+  dirty_all_rows(s);
+  return NULL;
+}
+
+/** getSelectionText(session) → string | null */
+static napi_value GetSelectionText(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  napi_value null_val;
+  NAPI_CALL(env, napi_get_null(env, &null_val));
+
+  GhosttySelection sel = GHOSTTY_INIT_SIZED(GhosttySelection);
+  if (ghostty_terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_SELECTION,
+                           &sel) != GHOSTTY_SUCCESS)
+    return null_val;
+
+  GhosttyFormatterTerminalOptions opts =
+      GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
+  opts.emit = GHOSTTY_FORMATTER_FORMAT_PLAIN;
+  opts.trim = true;
+  opts.unwrap = true;
+  opts.selection = &sel;
+
+  GhosttyFormatter formatter;
+  if (ghostty_formatter_terminal_new(NULL, &formatter, s->terminal, opts) !=
+      GHOSTTY_SUCCESS)
+    return null_val;
+
+  uint8_t *buf = NULL;
+  size_t len = 0;
+  napi_value result = null_val;
+  if (ghostty_formatter_format_alloc(formatter, NULL, &buf, &len) ==
+          GHOSTTY_SUCCESS &&
+      buf) {
+    napi_create_string_utf8(env, (const char *)buf, len, &result);
+    ghostty_free(NULL, buf, len);
+  }
+  ghostty_formatter_free(formatter);
   return result;
 }
 
@@ -1073,6 +1329,9 @@ NAPI_MODULE_INIT() {
       {"resize", NULL, Resize, NULL, NULL, NULL, napi_default, NULL},
       {"scroll", NULL, Scroll, NULL, NULL, NULL, napi_default, NULL},
       {"encodeKey", NULL, EncodeKey, NULL, NULL, NULL, napi_default, NULL},
+      {"setSelection", NULL, SetSelection, NULL, NULL, NULL, napi_default, NULL},
+      {"clearSelection", NULL, ClearSelection, NULL, NULL, NULL, napi_default, NULL},
+      {"getSelectionText", NULL, GetSelectionText, NULL, NULL, NULL, napi_default, NULL},
   };
   napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]), props);
   return exports;
