@@ -108,6 +108,38 @@ That is the residual, below-JS part.
   **stalls** — holding the consumer's imported ref couples to the main
   process's 2-surface reuse gate and the ack loop wedges. (A ring of surfaces
   would be needed to even try this, and rings alone didn't help.)
+- **`ImageBitmapRenderingContext.transferFromImageBitmap`** instead of 2D
+  `drawImage` (the purpose-built decoded-frame display path, clean layer
+  invalidation): F-bar still blank, though the *shape* of what's shown
+  differs (the selection bar renders full-width where 2D cut it off) — so the
+  canvas layer IS updating differently, just still not showing the trailing
+  frame's bottom rows. Combined with immediate-ack: still blank.
+
+## Strong caveat on the macOS observation method
+
+Every screenshot here was taken with `webContents.capturePage()` from the
+main process. That every single presentation path (2D drawImage, +fillRect,
+bitmaprenderer, continuous rAF loop) and every ack strategy produced the
+**identical** blank-F-bar `capturePage` output is itself suspicious — it may
+mean `capturePage` is snapshotting a stale/cached compositor frame rather than
+the live window, OR that the bug is truly universal below the JS layer. I
+could not get an independent ground-truth observation on this machine
+(`screencapture -R` needs screen-recording permission the sandbox lacks).
+
+**FIRST thing to do on Linux:** get a ground-truth capture that does NOT go
+through `capturePage` — an external screen grab, or an OS screenshot tool —
+at the moment the F-bar is blank. If an external grab shows the F-bar present
+while `capturePage` shows it blank, the "bug" in all my screenshots was a
+capturePage artifact and the real remaining issue is narrower (or absent) than
+it looks. If the external grab also shows it blank, it's the genuine
+compositor-present bug described above. This disambiguation is cheap and
+changes everything downstream.
+
+Notably the stats overlay (`<div>`, updated every 500ms) DID keep updating in
+all runs — so the window composites; only the canvas layer's content lags.
+That argues the canvas layer isn't re-uploading/invalidating for the
+sharedTexture-fed paint when the producer idles, which is the precise thing to
+instrument in the Chromium canvas/`cc` layer code.
 - **Present-loop ack-gate timeout / re-tick on ack**: these address a
   *different* (real but not-this) failure mode; didn't fix htop.
 - **`webContents.invalidate()` on the consumer window after each ack**
