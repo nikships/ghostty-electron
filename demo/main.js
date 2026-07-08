@@ -43,8 +43,13 @@ app.whenReady().then(async () => {
 
   /* ─── ghostty terminal (right) ─────────────────────────────────────── */
   const term = addon.create(COLS, ROWS, FONT_SIZE, scale);
-  const cssW = Math.ceil(term.width / scale);
-  const cssH = Math.ceil(term.height / scale);
+  let cssW = Math.ceil(term.width / scale);
+  let cssH = Math.ceil(term.height / scale);
+  // Grid size is mutable (auto-resizes with the window); the font — and thus
+  // the CSS cell size — is fixed, so cols/rows follow from the content area.
+  let cols = COLS, rows = ROWS;
+  const cellCssW = term.cellWidth / scale;
+  const cellCssH = term.cellHeight / scale;
 
   const ptyG = spawnShell(COLS, ROWS);
   const ghosttyWin = new BrowserWindow({
@@ -151,14 +156,54 @@ app.whenReady().then(async () => {
     }
   }, 500);
 
-  ipcMain.on('renderer-ready', () => {
+  function sendInit() {
+    if (ghosttyWin.isDestroyed()) return;
     ghosttyWin.webContents.send('init', {
       cssWidth: cssW,
       cssHeight: cssH,
-      cellWidth: term.cellWidth / scale,
-      cellHeight: term.cellHeight / scale
+      cellWidth: cellCssW,
+      cellHeight: cellCssH
     });
+  }
+
+  ipcMain.on('renderer-ready', () => {
+    sendInit();
     if (!presentTimer) presentTimer = setInterval(presentTick, 8);
+  });
+
+  // Auto-resize: derive cols/rows from the window's content area and the fixed
+  // cell size, then resize the terminal (reallocates IOSurfaces), the PTY, and
+  // the on-screen canvas to match. Debounced to once per frame — a drag emits a
+  // burst of 'resize' events. The 20px/60px chrome margins mirror the initial
+  // window sizing below.
+  let resizeTimer = null;
+  function applyResize() {
+    resizeTimer = null;
+    if (ghosttyWin.isDestroyed()) return;
+    const [winW, winH] = ghosttyWin.getContentSize();
+    const nextCols = Math.max(1, Math.floor((winW - 20) / cellCssW));
+    const nextRows = Math.max(1, Math.floor((winH - 60) / cellCssH));
+    if (nextCols === cols && nextRows === rows) return;
+    cols = nextCols;
+    rows = nextRows;
+    let dims;
+    try {
+      dims = addon.resize(term.session, cols, rows); // also reallocates surfaces
+    } catch { return; }
+    ptyG.resize(cols, rows);
+    cssW = Math.ceil(dims.width / scale);
+    cssH = Math.ceil(dims.height / scale);
+    // The surfaces are new buffers; drop the old present gate so the next
+    // render isn't withheld waiting on acks that reference freed surfaces.
+    seq = 0;
+    maxAckedSeq = 0;
+    lastSurfaceIndex = 0;
+    surfaceSeq[0] = surfaceSeq[1] = 0;
+    pendingSends.clear();
+    sendInit(); // restyle the canvas to the new CSS size
+  }
+  ghosttyWin.on('resize', () => {
+    if (!resizeTimer) resizeTimer = setTimeout(applyResize, 16);
   });
 
   let hasSelection = false;
@@ -184,8 +229,8 @@ app.whenReady().then(async () => {
   // Mouse selection: anchor on mousedown, extend on drag, keep on mouseup.
   let selAnchor = null;
   ipcMain.on('g-sel', (event, { phase, x, y }) => {
-    const cx = Math.max(0, Math.min(COLS - 1, x));
-    const cy = Math.max(0, Math.min(ROWS - 1, y));
+    const cx = Math.max(0, Math.min(cols - 1, x));
+    const cy = Math.max(0, Math.min(rows - 1, y));
     if (phase === 'start') {
       selAnchor = { x: cx, y: cy };
       clearSelection();
@@ -231,7 +276,7 @@ app.whenReady().then(async () => {
   ipcMain.on('g-selword', (event, { x, y }) => {
     try {
       const text = addon.selectWord(term.session,
-        Math.max(0, Math.min(COLS - 1, x)), Math.max(0, Math.min(ROWS - 1, y)));
+        Math.max(0, Math.min(cols - 1, x)), Math.max(0, Math.min(rows - 1, y)));
       hasSelection = !!text;
     } catch {}
   });
@@ -240,7 +285,7 @@ app.whenReady().then(async () => {
   const URL_RE = /https?:\/\/[^\s'"«»‹›]+/g;
   ipcMain.on('g-link', (event, { x, y }) => {
     try {
-      const line = addon.getText(term.session)[Math.max(0, Math.min(ROWS - 1, y))] || '';
+      const line = addon.getText(term.session)[Math.max(0, Math.min(rows - 1, y))] || '';
       for (const m of line.matchAll(URL_RE)) {
         if (x >= m.index && x < m.index + m[0].length) {
           shell.openExternal(m[0].replace(/[.,;:)\]]+$/, ''));
@@ -263,10 +308,10 @@ app.whenReady().then(async () => {
     try {
       if (query !== search.query) {
         const bar = addon.getScrollbar(term.session);
-        const rows = (addon.getRecentText(term.session, bar.total) || '').split('\n');
-        const base = bar.total - rows.length;
+        const lines = (addon.getRecentText(term.session, bar.total) || '').split('\n');
+        const base = bar.total - lines.length;
         const matches = [];
-        rows.forEach((line, i) => {
+        lines.forEach((line, i) => {
           let col = line.indexOf(query);
           while (query && col !== -1) {
             matches.push({ row: base + i, col });
@@ -281,12 +326,12 @@ app.whenReady().then(async () => {
       }
       search.idx = (search.idx + (dir || 1) + search.matches.length) % search.matches.length;
       const m = search.matches[search.idx];
-      addon.scrollToRow(term.session, Math.max(0, m.row - Math.floor(ROWS / 2)));
+      addon.scrollToRow(term.session, Math.max(0, m.row - Math.floor(rows / 2)));
       const offset = addon.getScrollbar(term.session).offset;
       const vy = m.row - offset;
-      if (vy >= 0 && vy < ROWS) {
+      if (vy >= 0 && vy < rows) {
         addon.setSelection(term.session, m.col, vy,
-          Math.min(COLS - 1, m.col + search.query.length - 1), vy);
+          Math.min(cols - 1, m.col + search.query.length - 1), vy);
         hasSelection = true;
       }
       event.sender.send('search-result', { count: search.matches.length, idx: search.idx + 1 });
@@ -297,10 +342,10 @@ app.whenReady().then(async () => {
   let scrollRemainder = 0;
   ipcMain.on('g-wheel', (event, { deltaY }) => {
     scrollRemainder += deltaY / (term.cellHeight / scale);
-    const rows = Math.trunc(scrollRemainder);
-    if (rows !== 0) {
-      scrollRemainder -= rows;
-      addon.scroll(term.session, rows);
+    const scrollRows = Math.trunc(scrollRemainder);
+    if (scrollRows !== 0) {
+      scrollRemainder -= scrollRows;
+      addon.scroll(term.session, scrollRows);
     }
   });
 

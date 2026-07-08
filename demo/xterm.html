@@ -5,7 +5,9 @@
   <title>xterm.js + WebGL</title>
   <style>
     * { margin: 0; padding: 0; }
-    body { background: #0d1117; height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
+    body { background: #0d1117; height: 100vh; overflow: hidden; }
+    /* Terminal fills the window so FitAddon can size the grid to it. */
+    #terminal { width: 100vw; height: 100vh; }
     #stats {
       position: fixed; top: 6px; right: 8px;
       font: 11px Menlo, monospace; color: #79c0ff;
@@ -28,8 +30,10 @@
 
     const { Terminal } = require('@xterm/xterm');
     const { WebglAddon } = require('@xterm/addon-webgl');
+    const { FitAddon } = require('@xterm/addon-fit');
 
     let term;
+    let fitAddon;
     let frames = 0;
     setInterval(() => {
       document.getElementById('stats').textContent = `${frames} fps`;
@@ -47,10 +51,24 @@
       });
       term.open(document.getElementById('terminal'));
       term.loadAddon(new WebglAddon());
+      fitAddon = new FitAddon();
+      term.loadAddon(fitAddon);
       term.onRender(() => frames++);
       term.onData((d) => ipcRenderer.send('x-input', d));
+      // FitAddon recomputes cols/rows from the element size; onResize then
+      // fires and forwards the new grid to the PTY via x-resize.
       term.onResize(({ cols, rows }) => ipcRenderer.send('x-resize', { cols, rows }));
       term.focus();
+
+      // Fit to the window now and on every resize (debounced to one per frame).
+      let raf = 0;
+      const fit = () => { try { fitAddon.fit(); } catch {} };
+      const scheduleFit = () => {
+        if (raf) return;
+        raf = requestAnimationFrame(() => { raf = 0; fit(); });
+      };
+      fit();
+      window.addEventListener('resize', scheduleFit);
     });
 
     ipcRenderer.on('x-data', (event, d) => term && term.write(d));
