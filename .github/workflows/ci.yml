@@ -52,16 +52,16 @@ jobs:
         run: npm run test:integration
 
       - name: In-terminal benchmark (burst + sustained)
-        run: node bench.js --runs 3
+        run: node bench/run.js flood --runs 3
 
       - name: PTY race benchmark (64 MiB)
-        run: npx electron pty-bench/main.js --mb 64 --interrupt-ms 2000
+        run: npx electron bench/pty-main.js --mb 64 --interrupt-ms 2000
 
       - name: Input-latency probe
-        run: npx electron pty-bench/main.js --latency --mb 8 --samples 4
+        run: npx electron bench/pty-main.js --latency --mb 8 --samples 4
 
       - name: Soak (2 min per terminal; trend measured after warm-up)
-        run: npx electron pty-bench/main.js --soak-min 2 --mb 16
+        run: npx electron bench/pty-main.js --soak-min 2 --mb 16
 
       - name: Render-stress benchmark
         run: npm run bench:render
@@ -124,13 +124,16 @@ jobs:
       - name: Parse benchmark (10 MiB)
         run: npm run bench:parse -- --mb 10 --runs 3
 
-      - name: xterm baseline benchmark (Electron under xvfb)
+      - name: DOM terminal benchmarks (Electron under xvfb)
         # SwiftShader WebGL2 is blocklisted by default on GPU-less machines;
         # both flags are required for the WebGL addon to initialize.
-        run: >
-          xvfb-run --auto-servernum npx electron --no-sandbox
-          --enable-unsafe-swiftshader --ignore-gpu-blocklist
-          xterm-bench/main.js
+        run: |
+          xvfb-run --auto-servernum npx electron --no-sandbox \
+            --enable-unsafe-swiftshader --ignore-gpu-blocklist \
+            bench/flood-dom-main.js --backend xterm
+          xvfb-run --auto-servernum npx electron --no-sandbox \
+            --enable-unsafe-swiftshader --ignore-gpu-blocklist \
+            bench/flood-dom-main.js --backend ghostty-web
 
       - name: Compare with previous main run
         if: always()
@@ -211,8 +214,10 @@ jobs:
       - name: Parse benchmark (10 MiB)
         run: npm run bench:parse -- --mb 10 --runs 3
 
-      - name: xterm baseline benchmark (Electron)
-        run: npx electron xterm-bench/main.js
+      - name: DOM terminal benchmarks (Electron)
+        run: |
+          npx electron bench/flood-dom-main.js --backend xterm
+          npx electron bench/flood-dom-main.js --backend ghostty-web
 
       # Experimental until proven on the GPU-less runner: sharedTexture
       # import of D3D11 NT handles under WARP inside Chromium's GPU process.
@@ -222,15 +227,19 @@ jobs:
         continue-on-error: true
         env:
           ELECTRON_ENABLE_LOGGING: "1"
-        run: npx electron ghostty-bench/main.js --screenshot --enable-logging
+        run: npx electron bench/flood-native-main.js --screenshot --enable-logging
 
       # ConPTY itself caps PTY throughput at ~0.1 MB/s on runners (measured
       # pipe ceiling) — this race exercises correctness there, not speed.
+      # timeout-minutes: at 0.1 MB/s a 2 MiB cat takes ~1 min per backend;
+      # the PowerShell interrupt probe has hung indefinitely before
+      # (continue-on-error masks a failure but not a hang).
       - name: PTY race smoke (ConPTY + PowerShell, experimental)
         continue-on-error: true
+        timeout-minutes: 10
         env:
           ELECTRON_ENABLE_LOGGING: "1"
-        run: npx electron pty-bench/main.js --mb 2 --interrupt-ms 500
+        run: npx electron bench/pty-main.js --mb 2 --interrupt-ms 500
 
       - name: Compare with previous main run
         if: always()

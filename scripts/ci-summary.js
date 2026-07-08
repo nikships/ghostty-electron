@@ -13,6 +13,7 @@ const parse = read('parse.json');
 const summary = read('summary.json');
 const pty = read('pty-bench.json');
 const xterm = read('xterm.json');
+const ghosttyWebFlood = read('ghostty-web.json');
 const latency = read('pty-latency.json');
 const soak = read('pty-soak.json');
 const stress = read('render-stress.json');
@@ -33,18 +34,36 @@ if (parse) {
   console.log('');
 }
 
+// Ordered [resultKey, label] pairs for every backend a suite may report;
+// rows render only when that backend produced results (older baselines and
+// platform-limited runs simply have fewer rows).
+const TERMINALS = [
+  ['xterm', 'xterm.js + WebGL'],
+  ['ghosttyWeb', 'ghostty-web (WASM)'],
+  ['ghostty', 'ghostty + sharedTexture']
+];
+const present = (r) => TERMINALS.filter(([key]) => r[key]);
+
 if (summary) {
   for (const [mode, r] of Object.entries(summary)) {
-    console.log(`### In-terminal ${mode} (${(r.xterm.payloadBytes / 1048576).toFixed(0)} MiB, Electron)\n`);
+    const first = present(r)[0];
+    if (!first) continue;
+    console.log(`### In-terminal ${mode} (${(r[first[0]].payloadBytes / 1048576).toFixed(0)} MiB, Electron)\n`);
     console.log('| backend | parse ms | e2e ms | frames |');
     console.log('|---|---|---|---|');
-    console.log(`| xterm.js + WebGL | ${r.xterm.parseMs.toFixed(1)} | ${r.xterm.e2eMs.toFixed(1)} | ${r.xterm.frames} |`);
-    console.log(`| ghostty + sharedTexture | ${r.ghostty.parseMs.toFixed(1)} | ${r.ghostty.e2eMs.toFixed(1)} | ${r.ghostty.frames} |`);
+    for (const [key, label] of present(r))
+      console.log(`| ${label} | ${r[key].parseMs.toFixed(1)} | ${r[key].e2eMs.toFixed(1)} | ${r[key].frames} |`);
     console.log('');
   }
-} else if (xterm) {
-  console.log(`### xterm baseline (${(xterm.payloadBytes / 1048576).toFixed(0)} MiB, Electron)\n`);
-  console.log(`parse ${xterm.parseMs.toFixed(1)} ms · e2e ${xterm.e2eMs.toFixed(1)} ms · ${xterm.frames} frames · ${xterm.throughputMBps.toFixed(1)} MB/s\n`);
+} else if (xterm || ghosttyWebFlood) {
+  // Standalone DOM flood runs (Linux/Windows CI — no orchestrated summary).
+  console.log(`### DOM terminal flood (Electron)\n`);
+  console.log('| backend | parse ms | e2e ms | frames | MB/s |');
+  console.log('|---|---|---|---|---|');
+  for (const [label, r] of [['xterm.js + WebGL', xterm], ['ghostty-web (WASM)', ghosttyWebFlood]]) {
+    if (r) console.log(`| ${label} | ${r.parseMs.toFixed(1)} | ${r.e2eMs.toFixed(1)} | ${r.frames} | ${r.throughputMBps.toFixed(1)} |`);
+  }
+  console.log('');
 }
 
 if (pty) {
@@ -52,8 +71,8 @@ if (pty) {
   console.log(`pipe ceiling: ${pty.pipeCeiling.MBps} MB/s\n`);
   console.log('| terminal | cat ms | MB/s | Ctrl+C→response ms | cpu s | mem growth MB |');
   console.log('|---|---|---|---|---|---|');
-  console.log(`| xterm | ${pty.xterm.catMs} | ${pty.xterm.MBps} | ${pty.xterm.interruptMs} | ${pty.xterm.cpuTotal} | ${pty.xterm.peakMemMB} |`);
-  console.log(`| ghostty | ${pty.ghostty.catMs} | ${pty.ghostty.MBps} | ${pty.ghostty.interruptMs} | ${pty.ghostty.cpuTotal} | ${pty.ghostty.peakMemMB} |`);
+  for (const [key, label] of present(pty))
+    console.log(`| ${label} | ${pty[key].catMs} | ${pty[key].MBps} | ${pty[key].interruptMs} | ${pty[key].cpuTotal} | ${pty[key].peakMemMB} |`);
   console.log('');
 }
 
@@ -61,8 +80,8 @@ if (latency) {
   console.log('### Input latency (keystroke → echo visible)\n');
   console.log('| terminal | idle p50 | idle p95 | busy p50 | busy p95 |');
   console.log('|---|---|---|---|---|');
-  console.log(`| xterm | ${latency.xterm.idleP50Ms} | ${latency.xterm.idleP95Ms} | ${latency.xterm.floodP50Ms} | ${latency.xterm.floodP95Ms} |`);
-  console.log(`| ghostty | ${latency.ghostty.idleP50Ms} | ${latency.ghostty.idleP95Ms} | ${latency.ghostty.floodP50Ms} | ${latency.ghostty.floodP95Ms} |`);
+  for (const [key, label] of present(latency))
+    console.log(`| ${label} | ${latency[key].idleP50Ms} | ${latency[key].idleP95Ms} | ${latency[key].floodP50Ms} | ${latency[key].floodP95Ms} |`);
   console.log('');
 }
 
@@ -70,8 +89,8 @@ if (soak) {
   console.log(`### Soak (${soak.minutes} min sustained output) — ${soak.pass ? 'PASS' : 'FAIL'}\n`);
   console.log('| terminal | consumed MB | mem slope MB/min | cpu s |');
   console.log('|---|---|---|---|');
-  console.log(`| xterm | ${soak.xterm.bytesConsumedMB} | ${soak.xterm.memSlopeMBperMin} | ${soak.xterm.cpuTotal} |`);
-  console.log(`| ghostty | ${soak.ghostty.bytesConsumedMB} | ${soak.ghostty.memSlopeMBperMin} | ${soak.ghostty.cpuTotal} |`);
+  for (const [key, label] of present(soak))
+    console.log(`| ${label} | ${soak[key].bytesConsumedMB} | ${soak[key].memSlopeMBperMin} | ${soak[key].cpuTotal} |`);
   console.log('');
 }
 

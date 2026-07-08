@@ -14,7 +14,7 @@ The demo is accidentally ~70% of the package:
 |---|---|---|
 | VT session core (parse, text, keys, selection, search hooks) | `native/src/vt.c` | yes — platform-independent, tested |
 | macOS presenter (CoreText → IOSurface, dirty rows) | `native/src/producer_mac.m` | yes |
-| Present loop (dirty-gated, ack-gated double buffering) | duplicated in `demo/`, `ghostty-bench/`, `pty-bench/` | needs extraction into one module |
+| Present loop (dirty-gated, ack-gated double buffering) | duplicated in `demo/` and `bench/` (flood-native + pty native runner) | needs extraction into one module |
 | Renderer consumer (VideoFrame → canvas, acks) | `demo/preload-ghostty.js` | needs extraction + de-demo-ing |
 | Input (mode-aware keys, selection, IME, scroll, search) | demo main + preload | needs API-ification |
 | Tests (pixel, conformance, fuzz, equivalence) | `test/` | reusable nearly as-is |

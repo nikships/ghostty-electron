@@ -1,18 +1,26 @@
 # ghostty-xterm-bench
 
-A fair, measured comparison of two terminal architectures inside Electron:
+A fair, measured comparison of three terminal architectures inside Electron:
 
 1. **xterm.js + WebGL addon** — parse *and* render inside the Chromium
    renderer process. This is how VS Code's integrated terminal works today.
-2. **libghostty-vt + sharedTexture** — [libghostty-vt](https://github.com/ghostty-org/ghostty)
+2. **ghostty-web (WASM)** — [coder/ghostty-web](https://github.com/coder/ghostty-web):
+   ghostty's VT engine compiled to WebAssembly with an xterm.js-compatible
+   API, parsing and canvas-rendering in the same renderer process. Same
+   architecture as xterm.js, different engine.
+3. **libghostty-vt + sharedTexture** — [libghostty-vt](https://github.com/ghostty-org/ghostty)
    (ghostty's native VT engine) parses in the main process, a native addon
    draws the grid into an **IOSurface**, and Electron's `sharedTexture`
    module transfers it **zero-copy** into a fully sandboxed renderer
    `<canvas>` as a `VideoFrame`.
 
+Two of the three run the *same* ghostty parser, and two of the three share
+the *same* in-renderer architecture — so the comparison separates the
+engine effect from the architecture effect on every metric.
+
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks-dark.svg">
-  <img alt="Benchmark results: parser throughput 11x, 10MiB flood 18x, 1GiB PTY cat 2.2x, Ctrl+C response 21x in ghostty's favor" src="assets/benchmarks-light.svg">
+  <img alt="Benchmark results for xterm.js vs ghostty-web (WASM) vs libghostty: parser throughput 12x native, 10MiB flood 18x, 1GiB PTY cat 2.2x, Ctrl+C response 24x in native ghostty's favor; ghostty-web lands between the two on every metric except the PTY cat, where it's fastest" src="assets/benchmarks-light.svg">
 </picture>
 
 ## Motivation
@@ -86,13 +94,19 @@ the xterm-vs-native pair.
 Feed the payload directly to each terminal at full speed and stop the clock
 when the final frame is confirmed presented (double-rAF / frame ack):
 
-| mode | xterm.js parse / e2e | ghostty parse / e2e | e2e speedup |
-|---|---|---|---|
-| burst (1 MiB) | 104.6 / 113.7 ms | 8.1 / 20.9 ms | **5.4×** |
-| sustained (10 MiB) | 1170 / 1183 ms | 53.6 / 65.1 ms | **18.2×** |
+| mode | xterm.js e2e | ghostty-web e2e | libghostty e2e | native vs xterm |
+|---|---|---|---|---|
+| burst (1 MiB) | 139 ms | 111 ms | 24 ms | **5.8×** |
+| sustained (10 MiB) | 1200 ms | 968 ms | 66 ms | **18.3×** |
 
 ghostty's native draw cost for the entire sustained run is ~3 ms — dirty-row
 tracking plus glyph runs make presentation nearly free; the gap is the parser.
+ghostty-web's 3× parser advantage largely evaporates here: its feed loop
+shares the renderer's JS thread with its own 2D-canvas painter (and the
+event-loop yields that keep the window responsive), so end-to-end it only
+edges out xterm.js by ~1.2×. The flood is capped by the in-renderer
+architecture, not the engine — which is precisely the effect the third row
+exists to isolate.
 
 ### 3. The full-stack PTY race — `npm run bench:pty` (Electron, macOS)
 
@@ -102,17 +116,22 @@ interrupt recovery: Ctrl+C mid-flood, then time until a fresh echo is visible.
 
 | terminal | cat 1 GiB | MB/s | Ctrl+C→response | CPU | mem growth |
 |---|---|---|---|---|---|
-| xterm.js | 54.9 s | 18.6 | 1007 ms | 5.9 s | 369 MB |
-| ghostty | **24.6 s** | 41.6 | **48 ms** | 2.8 s | 49 MB |
+| xterm.js | 55.4 s | 18.5 | 1124 ms | 5.9 s | 320 MB |
+| ghostty-web | **20.3 s** | 50.3 | 424 ms | 3.4 s | 144 MB |
+| ghostty | 25.6 s | 40.0 | **47 ms** | 2.9 s | 25 MB |
 
 Through a real PTY the plumbing dominates: node-pty delivers ~1 KB chunks and
-caps the pipe at ~50–65 MB/s (a control run reports this ceiling), so the
-completion gap compresses to **2.2×** — and at small sizes (≤8 MiB) vanishes
-entirely. The metrics that stay dramatic are the responsiveness ones:
-**21× faster interrupt recovery** (xterm has to chew its flow-control backlog
-before your keystroke's effect appears), at ~2× less CPU and ~7× less memory
-growth. This is the honest headline: *architecture buys you latency under
-load more than it buys you raw completion time.*
+caps the pipe at ~50–65 MB/s (a control run reports this ceiling). Both
+ghostty-engine terminals run at or near that ceiling — ghostty-web actually
+*completes* fastest (its cat run sat closest to the 64 MB/s pipe ceiling on
+this run), and at small sizes (≤8 MiB) the completion gap vanishes entirely.
+The metric that stays dramatic is responsiveness: **24× faster interrupt
+recovery for native ghostty** (47 ms vs 1124 ms — xterm has to chew its
+flow-control backlog before your keystroke's effect appears; ghostty-web,
+same in-renderer flow control, still needs 424 ms), at ~2× less CPU and ~13×
+less memory growth. This is the honest headline: *architecture buys you
+latency under load more than it buys you raw completion time — and the
+interrupt row is the one where only main-process parsing helps.*
 
 ### Input latency — `npm run bench:pty -- --latency` (macOS)
 
@@ -124,14 +143,22 @@ frame in any terminal — unmeasurable by definition):
 | terminal | idle p50 | busy p50 |
 |---|---|---|
 | xterm.js | 32.5 ms | 36.1 ms |
+| ghostty-web | 16.8 ms | 24.5 ms |
 | ghostty | **17 ms** | **11.6 ms** |
+
+(ghostty-web row measured on a later, loaded run — its idle latency matches
+native ghostty's, as expected for the same engine; under load it sits between
+the two.)
 
 ### Leak soak — `npm run bench:pty -- --soak-min 10`
 
 Ten minutes of continuous full-speed output per terminal, memory sampled
 every 2 s, least-squares slope after warm-up must stay under 10 MB/min:
 ghostty consumed **28.2 GB** (slope 0.29 MB/min), xterm 15.2 GB (slope 0) —
-both flat, no leaks. CI runs a 2-minute version on every push.
+both flat, no leaks. CI runs a 2-minute version on every push. ghostty-web
+is measured and reported but excluded from the pass/fail gate (its WASM heap
+grew ~30 MB/min on a CI 2-min soak — upstream ghostty-web behavior, not this
+repo's code; the gate exists to catch leaks in the native addon).
 
 ### vs stock Ghostty.app — `npm run bench:stock` (macOS)
 
@@ -174,7 +201,7 @@ All three OSes run in CI on every push:
 |---|---|---|---|
 | libghostty-vt build (zig) | ✅ | ✅ (msvc ABI) | ✅ |
 | parser benchmark + conformance/fuzz tests | ✅ | ✅ | ✅ |
-| xterm.js baseline benchmark | ✅ | ✅ | ✅ (xvfb + SwiftShader) |
+| DOM terminal benchmarks (xterm.js, ghostty-web) | ✅ | ✅ | ✅ (xvfb + SwiftShader) |
 | native presentation producer | ✅ IOSurface + CoreText | ✅ D3D11 + DirectWrite — pixel + render-equivalence tests pass on CI (WARP) | ⬜ needs dmabuf |
 | in-Electron sharedTexture GUI | ✅ | 🟡 implemented; validation on GPU-less runners in progress | ⬜ |
 | PTY race + latency + soak | ✅ | 🟡 runs, but **ConPTY caps the pipe at ~0.1 MB/s** on runners — Windows PTY numbers measure ConPTY, not the terminals | ⬜ |
@@ -271,23 +298,33 @@ npm run bench:pty      # the 1 GiB PTY race (add --mb 64 for a quick run)
 npm run demo           # side-by-side live shells
 ```
 
-On Windows, the same steps run everything except `bench`, `bench:pty`, and
-`demo` (they need the macOS producer for the ghostty side).
+On Windows and Linux the same steps run the parser suite and the DOM
+backends (xterm.js, ghostty-web); the native ghostty side of `bench`,
+`bench:pty`, and `demo` needs the macOS producer. `bench:pty` drops the
+native backend automatically where the addon has no platform renderer.
 
 ## Layout
 
 ```
+bench/                     THE benchmark app — all suites, all terminals
+bench/backends.js            the terminal registry (add a terminal here)
+bench/run.js                 entry point: parse | flood | pty
+bench/parse.js               parser-only suite (plain node, every OS)
+bench/flood*.js|.html        in-terminal flood (DOM backends + native)
+bench/pty-main.js|pty-dom…   PTY race / latency / soak, per-backend runners
+bench/dom-terminal.js        one factory for xterm.js-compatible libraries
 native/src/vt.c            platform-independent libghostty-vt session (all OSes)
 native/src/producer_mac.m  macOS: CoreText → IOSurface presentation layer
 native/src/producer_stub.c non-mac: VT-only until a platform producer exists
-scripts/                   payload gen, ghostty build, parse bench, chart gen
-xterm-bench/               baseline Electron app (xterm.js + WebGL addon)
-ghostty-bench/             sharedTexture Electron app (producer in main process)
-pty-bench/                 end-to-end race: cat via real PTYs, sentinel-timed
+scripts/                   payload gen, ghostty build, chart gen, CI reporting
 demo/                      side-by-side interactive shells (node-pty)
 test/                      addon, conformance, fuzz, integration suites
-bench.js                   in-terminal runner (burst + sustained) + table
 ```
+
+Adding a terminal: register it in `bench/backends.js` (a `dom`-kind backend
+that speaks the xterm.js API needs only a `dom-terminal.js` factory case);
+every suite, the CI summary, and the regression compare pick it up from the
+registry.
 
 ## Caveats
 

@@ -1,6 +1,7 @@
 'use strict';
 /**
- * PTY benchmark: the end-to-end terminal race.
+ * PTY benchmark: the end-to-end terminal race, across every backend in
+ * bench/backends.js.
  *
  * Primary metric — wall-clock from issuing `cat <bigfile>` in a real shell
  * (node-pty) until the shell's completion sentinel is VISIBLE ON SCREEN
@@ -16,27 +17,27 @@
  *     consumer, to show whether the plumbing (not the terminal) limits.
  *
  * Fairness notes:
- *   - Both terminals: same shell (zsh), same PTY plumbing, same grid
+ *   - All terminals: same shell (zsh), same PTY plumbing, same grid
  *     (120×30 @ devicePixelRatio), visible focused windows, sequential runs
  *     with a warm file cache.
- *   - The xterm window gets VS Code-style flow control (pause the PTY when
+ *   - DOM windows get VS Code-style flow control (pause the PTY when
  *     >32 MiB is unparsed, resume under 8 MiB) — without it, a 1 GiB flood
- *     queues gigabytes of strings in the renderer and OOMs. ghostty needs
- *     none: the main process parses synchronously, so backpressure is
- *     inherent.
+ *     queues gigabytes of strings in the renderer and OOMs. ghostty-web
+ *     parses synchronously on write, so its ack (and thus resume) tracks
+ *     actual parse progress just like xterm's async callback. The native
+ *     backend needs none: the main process parses synchronously, so
+ *     backpressure is inherent.
  *
  * Flags: --mb N (default 1024), --interrupt-ms N (default 4000), --keep-file
+ *        --latency, --soak-min N, --backends a,b (subset filter)
  */
 const { app, BrowserWindow, ipcMain, screen, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const pty = require('node-pty');
+const { BACKENDS } = require('./backends');
 
 const addon = require(path.join(__dirname, '..', 'native', 'build', 'Release', 'ghostty_producer.node'));
-if (typeof addon.render !== 'function') {
-  console.error('No platform renderer in the addon on this OS.');
-  process.exit(1);
-}
 
 const COLS = 120;
 const ROWS = 30;
@@ -54,6 +55,18 @@ const INTERRUPT_MS = flagNum('--interrupt-ms', 4000);
 const SAMPLES = flagNum('--samples', 8);
 const LATENCY = process.argv.includes('--latency');
 const SOAK_MIN = flagNum('--soak-min', 0);
+
+// Optional subset (e.g. --backends xterm,ghostty); native backend drops out
+// automatically where the addon has no platform renderer.
+const subsetIdx = process.argv.indexOf('--backends');
+const subset = subsetIdx !== -1 ? process.argv[subsetIdx + 1].split(',') : null;
+const RUNNABLE = BACKENDS.filter((b) =>
+  (!subset || subset.includes(b.key)) &&
+  (b.kind !== 'native' || typeof addon.render === 'function'));
+if (RUNNABLE.length === 0) {
+  console.error('no runnable backends on this platform');
+  process.exit(1);
+}
 
 // Sentinels: built with $((…)) so the *typed command* echoed to the screen
 // never matches the exact output line we search for.
@@ -88,6 +101,16 @@ const KILL_LINE = IS_WIN ? '\x1b' : '\x15';
 // lands on a presented frame in ANY terminal — unmeasurable by definition.
 const busyCmd =
   `node -e "const l='x'.repeat(60);let n=0;setInterval(()=>{for(let i=0;i<100;i++)console.log('busy'+(n++)+' '+l)},50)"\r`;
+
+// Watchdog: a stuck finish-line wait (e.g. ConPTY swallowing the interrupt
+// echo on a Windows runner — observed hanging a CI job ~20 min until
+// cancelled) must fail the run, not hang until the job timeout. Scaled up
+// for soak runs, which are long by design.
+const WATCHDOG_MIN = flagNum('--watchdog-min', SOAK_MIN > 0 ? SOAK_MIN * 4 + 10 : 30);
+setTimeout(() => {
+  console.error(`watchdog: pty-bench did not complete within ${WATCHDOG_MIN} min`);
+  app.exit(1);
+}, WATCHDOG_MIN * 60_000);
 
 const now = () => performance.now();
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -194,7 +217,7 @@ function pipeCeiling(file) {
   });
 }
 
-/* ── ghostty runner ──────────────────────────────────────────────────── */
+/* ── native (libghostty + sharedTexture) runner ──────────────────────── */
 
 async function ghosttyRun(file, { interrupt, latency, soak }) {
   for (const ch of ['renderer-ready', 'frame-presented']) ipcMain.removeAllListeners(ch);
@@ -338,7 +361,7 @@ async function ghosttyRun(file, { interrupt, latency, soak }) {
         await sleep(3);
       }
       // Confirm a frame produced *after* detection was presented — the same
-      // finish line as xterm's double-rAF report.
+      // finish line as the DOM backends' double-rAF report.
       const seqAtDetect = seq;
       const t2 = now();
       while (!(seq > seqAtDetect && maxAcked >= seqAtDetect + 1) &&
@@ -400,15 +423,15 @@ async function ghosttyRun(file, { interrupt, latency, soak }) {
   return result;
 }
 
-/* ── xterm runner ────────────────────────────────────────────────────── */
+/* ── DOM runner (xterm.js, ghostty-web — anything in-renderer) ───────── */
 
-async function xtermRun(file, { interrupt, latency, soak }) {
-  for (const ch of ['x-ready', 'x-input', 'x-acked', 'x-found']) ipcMain.removeAllListeners(ch);
+async function domRun(backend, file, { interrupt, latency, soak }) {
+  for (const ch of ['x-ready', 'x-term-up', 'x-term-error', 'x-input', 'x-acked', 'x-found']) ipcMain.removeAllListeners(ch);
 
   const win = new BrowserWindow({
     width: 1100,
     height: 620,
-    title: `xterm pty-bench${interrupt ? ' (interrupt probe)' : latency ? ' (latency probe)' : ''}`,
+    title: `${backend.key} pty-bench${interrupt ? ' (interrupt probe)' : latency ? ' (latency probe)' : ''}`,
     // backgroundThrottling: an occluded window otherwise gets its rAF
     // suspended and setTimeout clamped — it silently poisoned an overnight
     // run with ~18 minutes of "waiting for a frame". VS Code disables it too.
@@ -447,13 +470,20 @@ async function xtermRun(file, { interrupt, latency, soak }) {
   if (process.env.PTYBENCH_DEBUG) {
     ipcMain.removeAllListeners('x-debug');
     ipcMain.on('x-debug', (e, d) =>
-      console.log(`  [xterm grid] vY=${d.viewportY} baseY=${d.baseY} tail=${JSON.stringify(d.tail)}`));
+      console.log(`  [${backend.key} grid] base=${d.base} len=${d.length} tail=${JSON.stringify(d.tail)}`));
   }
 
   const ready = new Promise((r) => ipcMain.on('x-ready', r));
-  await win.loadFile(path.join(__dirname, 'xterm.html'));
+  await win.loadFile(path.join(__dirname, 'pty-dom.html'));
   await ready;
-  win.webContents.send('x-config', { cols: COLS, rows: ROWS, fontSize: FONT_SIZE });
+  // Terminal construction is async for WASM backends — wait for the page to
+  // confirm the terminal is actually up (or surface its failure).
+  const termUp = new Promise((resolve, reject) => {
+    ipcMain.on('x-term-up', resolve);
+    ipcMain.on('x-term-error', (e, msg) => reject(new Error(`${backend.key} terminal init failed: ${msg}`)));
+  });
+  win.webContents.send('x-config', { cols: COLS, rows: ROWS, fontSize: FONT_SIZE, backend });
+  await termUp;
 
   function visible(marker, pollMs = 50, depth = 0) {
     return new Promise((resolve) => {
@@ -474,10 +504,10 @@ async function xtermRun(file, { interrupt, latency, soak }) {
   await sleep(200);
 
   const debugTimer = process.env.PTYBENCH_DEBUG
-    ? setInterval(() => console.log(`  [xterm] sent=${(sentBytes / 1048576).toFixed(1)}MB acked=${(ackedBytes / 1048576).toFixed(1)}MB paused=${paused}`), 2000)
+    ? setInterval(() => console.log(`  [${backend.key}] sent=${(sentBytes / 1048576).toFixed(1)}MB acked=${(ackedBytes / 1048576).toFixed(1)}MB paused=${paused}`), 2000)
     : null;
 
-  const sampler = startMetricsSampler();
+  const sampler = startMetricsSampler({ series: !!soak });
   const result = {};
   const t0 = now();
 
@@ -489,22 +519,28 @@ async function xtermRun(file, { interrupt, latency, soak }) {
     result.soakMinutes = SOAK_MIN;
     result.bytesConsumedMB = Math.round(sentBytes / 1048576);
   } else if (latency) {
-    // Keystroke→visible-echo latency (see the ghostty runner for the model);
-    // detection deep-scans the tail of the renderer's buffer.
+    // Keystroke→visible-echo latency (see the native runner for the model);
+    // detection deep-scans the tail of the renderer's buffer. The wait is
+    // bounded: an echo that scrolls past the scan depth before a scan tick
+    // lands must drop the sample, not hang the suite (a ghostty-web run once
+    // sat 30+ minutes on exactly this).
     const measure = async (marker) => {
       const found = visible(marker, 10, 300);
       const t = now();
       shell.write(marker);
-      await found;
-      return now() - t;
+      const hit = await Promise.race([found, sleep(10_000).then(() => null)]);
+      return hit === null ? null : now() - t;
     };
+    // 150 ms window: the busy load ticks every 50 ms, so a 30 ms window
+    // false-reports "flood ended" ~40% of the time.
     const floodActive = () => {
       const before = sentBytes;
-      return sleep(30).then(() => sentBytes > before);
+      return sleep(150).then(() => sentBytes > before);
     };
     const idle = [];
     for (let i = 0; i < SAMPLES; i++) {
-      idle.push(await measure(`zq${i}xj`));
+      const s = await measure(`zq${i}xj`);
+      if (s != null) idle.push(s);
       shell.write(KILL_LINE);
       await sleep(150);
     }
@@ -514,7 +550,7 @@ async function xtermRun(file, { interrupt, latency, soak }) {
     let dropped = 0;
     for (let i = 0; i < SAMPLES; i++) {
       const sample = await measure(`fq${i}xj`);
-      if (await floodActive()) flood.push(sample);
+      if (sample != null && await floodActive()) flood.push(sample);
       else { dropped++; break; }
       await sleep(350);
     }
@@ -555,6 +591,9 @@ async function xtermRun(file, { interrupt, latency, soak }) {
   return result;
 }
 
+const runnerFor = (backend) => (file, opts) =>
+  backend.kind === 'native' ? ghosttyRun(file, opts) : domRun(backend, file, opts);
+
 /* ── main ────────────────────────────────────────────────────────────── */
 
 app.on('window-all-closed', () => { /* keep alive between runs */ });
@@ -563,26 +602,34 @@ app.whenReady().then(async () => {
   try {
     const file = ensurePayload();
     const mb = fs.statSync(file).size / (1024 * 1024);
+    const resultsDir = path.join(__dirname, '..', 'results');
+    const pad = (s, n) => String(s).padStart(n);
+    const meta = {
+      electronVersion: process.versions.electron,
+      platform: process.platform,
+      arch: process.arch
+    };
 
     if (SOAK_MIN > 0) {
       const LIMIT_MB_PER_MIN = 10;
-      console.log(`\nghostty: ${SOAK_MIN} min soak...`);
-      const g = await ghosttyRun(file, { soak: true });
-      console.log(`  consumed ${g.bytesConsumedMB} MB · mem slope ${g.memSlopeMBperMin} MB/min · cpu ${g.cpuTotal}s`);
-      console.log(`xterm: ${SOAK_MIN} min soak...`);
-      const x = await xtermRun(file, { soak: true });
-      console.log(`  consumed ${x.bytesConsumedMB} MB · mem slope ${x.memSlopeMBperMin} MB/min · cpu ${x.cpuTotal}s`);
-
-      const pass = Math.abs(g.memSlopeMBperMin) < LIMIT_MB_PER_MIN &&
-                   Math.abs(x.memSlopeMBperMin) < LIMIT_MB_PER_MIN;
-      const out = {
-        mode: 'soak', minutes: SOAK_MIN, limitMBperMin: LIMIT_MB_PER_MIN, pass,
-        ghostty: g, xterm: x,
-        electronVersion: process.versions.electron,
-        platform: process.platform, arch: process.arch
-      };
-      console.log(`\n  soak ${pass ? 'PASS' : 'FAIL'} (|mem slope| < ${LIMIT_MB_PER_MIN} MB/min after warm-up)`);
-      const resultsDir = path.join(__dirname, '..', 'results');
+      const perBackend = {};
+      for (const backend of RUNNABLE) {
+        console.log(`\n${backend.key}: ${SOAK_MIN} min soak...`);
+        const r = await runnerFor(backend)(file, { soak: true });
+        console.log(`  consumed ${r.bytesConsumedMB} MB · mem slope ${r.memSlopeMBperMin} MB/min · cpu ${r.cpuTotal}s`);
+        perBackend[backend.resultKey] = r;
+      }
+      // Gate only on backends whose leaks are ours to fix (soakGate !== false
+      // in the registry); the rest are measured and reported informationally.
+      // Growth-only: a leak is a POSITIVE slope. A negative slope is GC
+      // reclaiming the flood's buffers after warm-up (a CI run measured
+      // xterm at -63.75 MB/min — memory going down is not a leak).
+      const pass = RUNNABLE
+        .filter((b) => b.soakGate !== false)
+        .every((b) => perBackend[b.resultKey].memSlopeMBperMin < LIMIT_MB_PER_MIN);
+      const out = { mode: 'soak', minutes: SOAK_MIN, limitMBperMin: LIMIT_MB_PER_MIN, pass, ...perBackend, ...meta };
+      const gated = RUNNABLE.filter((b) => b.soakGate !== false).map((b) => b.key).join(', ');
+      console.log(`\n  soak ${pass ? 'PASS' : 'FAIL'} (mem slope < ${LIMIT_MB_PER_MIN} MB/min after warm-up; gated: ${gated})`);
       fs.mkdirSync(resultsDir, { recursive: true });
       fs.writeFileSync(path.join(resultsDir, 'pty-soak.json'), JSON.stringify(out, null, 2));
       app.exit(pass ? 0 : 1);
@@ -590,34 +637,25 @@ app.whenReady().then(async () => {
     }
 
     if (LATENCY) {
-      console.log(`\nghostty: latency probe (${SAMPLES} samples idle + mid-flood)...`);
-      const g = await ghosttyRun(file, { latency: true });
-      console.log(`  idle p50 ${g.idleP50Ms} ms · flood p50 ${g.floodP50Ms} ms`);
-      console.log(`xterm: latency probe...`);
-      const x = await xtermRun(file, { latency: true });
-      console.log(`  idle p50 ${x.idleP50Ms} ms · flood p50 ${x.floodP50Ms} ms`);
-
-      const out = {
-        mode: 'latency',
-        sizeMB: mb,
-        samples: SAMPLES,
-        ghostty: g,
-        xterm: x,
-        electronVersion: process.versions.electron,
-        platform: process.platform,
-        arch: process.arch
-      };
-      const pad = (s, n) => String(s).padStart(n);
+      const perBackend = {};
+      for (const backend of RUNNABLE) {
+        console.log(`\n${backend.key}: latency probe (${SAMPLES} samples idle + mid-flood)...`);
+        const r = await runnerFor(backend)(file, { latency: true });
+        console.log(`  idle p50 ${r.idleP50Ms} ms · flood p50 ${r.floodP50Ms} ms`);
+        perBackend[backend.resultKey] = r;
+      }
+      const out = { mode: 'latency', sizeMB: mb, samples: SAMPLES, ...perBackend, ...meta };
       console.log('\n' + '═'.repeat(78));
       console.log(`  INPUT LATENCY: keystroke → echo visible on screen (${SAMPLES} samples)`);
       console.log('═'.repeat(78));
-      console.log(`  ${'terminal'.padEnd(10)} ${pad('idle p50', 10)} ${pad('idle p95', 10)} ${pad('flood p50', 11)} ${pad('flood p95', 11)}`);
+      console.log(`  ${'terminal'.padEnd(14)} ${pad('idle p50', 10)} ${pad('idle p95', 10)} ${pad('flood p50', 11)} ${pad('flood p95', 11)}`);
       console.log('  ' + '─'.repeat(74));
-      console.log(`  ${'xterm'.padEnd(10)} ${pad(x.idleP50Ms, 10)} ${pad(x.idleP95Ms, 10)} ${pad(x.floodP50Ms, 11)} ${pad(x.floodP95Ms, 11)}`);
-      console.log(`  ${'ghostty'.padEnd(10)} ${pad(g.idleP50Ms, 10)} ${pad(g.idleP95Ms, 10)} ${pad(g.floodP50Ms, 11)} ${pad(g.floodP95Ms, 11)}`);
+      for (const backend of RUNNABLE) {
+        const r = perBackend[backend.resultKey];
+        console.log(`  ${backend.key.padEnd(14)} ${pad(r.idleP50Ms, 10)} ${pad(r.idleP95Ms, 10)} ${pad(r.floodP50Ms, 11)} ${pad(r.floodP95Ms, 11)}`);
+      }
       console.log('═'.repeat(78));
 
-      const resultsDir = path.join(__dirname, '..', 'results');
       fs.mkdirSync(resultsDir, { recursive: true });
       fs.writeFileSync(path.join(resultsDir, 'pty-latency.json'), JSON.stringify(out, null, 2));
       if (!process.argv.includes('--keep-file') && SIZE_MB >= 256) fs.unlinkSync(file);
@@ -629,46 +667,39 @@ app.whenReady().then(async () => {
     const pipe = await pipeCeiling(file);
     console.log(`  ${pipe.MBps} MB/s (${pipe.ms} ms)`);
 
-    console.log(`\nghostty: cat ${mb} MiB...`);
-    const g = await ghosttyRun(file, { interrupt: false });
-    console.log(`  ${g.catMs} ms`);
-    console.log(`ghostty: interrupt probe (Ctrl+C at ${INTERRUPT_MS} ms)...`);
-    const gi = await ghosttyRun(file, { interrupt: true });
-    console.log(`  ${gi.interruptMs} ms to PONG`);
-
-    console.log(`\nxterm: cat ${mb} MiB...`);
-    const x = await xtermRun(file, { interrupt: false });
-    console.log(`  ${x.catMs} ms`);
-    console.log(`xterm: interrupt probe (Ctrl+C at ${INTERRUPT_MS} ms)...`);
-    const xi = await xtermRun(file, { interrupt: true });
-    console.log(`  ${xi.interruptMs} ms to PONG`);
-
     const MBps = (r) => +(mb / (r.catMs / 1000)).toFixed(1);
-    const summary = {
-      sizeMB: mb,
-      interruptAtMs: INTERRUPT_MS,
-      pipeCeiling: pipe,
-      ghostty: { ...g, MBps: MBps(g), interruptMs: gi.interruptMs, interruptRun: gi },
-      xterm: { ...x, MBps: MBps(x), interruptMs: xi.interruptMs, interruptRun: xi },
-      electronVersion: process.versions.electron,
-      platform: process.platform,
-      arch: process.arch
-    };
+    const perBackend = {};
+    for (const backend of RUNNABLE) {
+      console.log(`\n${backend.key}: cat ${mb} MiB...`);
+      const run = runnerFor(backend);
+      const r = await run(file, { interrupt: false });
+      console.log(`  ${r.catMs} ms`);
+      console.log(`${backend.key}: interrupt probe (Ctrl+C at ${INTERRUPT_MS} ms)...`);
+      const ri = await run(file, { interrupt: true });
+      console.log(`  ${ri.interruptMs} ms to PONG`);
+      perBackend[backend.resultKey] = { ...r, MBps: MBps(r), interruptMs: ri.interruptMs, interruptRun: ri };
+    }
 
-    const pad = (s, n) => String(s).padStart(n);
+    const summary = { sizeMB: mb, interruptAtMs: INTERRUPT_MS, pipeCeiling: pipe, ...perBackend, ...meta };
+
     console.log('\n' + '═'.repeat(86));
     console.log(`  PTY RACE: cat ${mb} MiB in a real zsh — sentinel visible on screen`);
     console.log(`  pipe ceiling: ${pipe.MBps} MB/s — grid ${COLS}×${ROWS} — Electron ${process.versions.electron}`);
     console.log('═'.repeat(86));
-    console.log(`  ${'terminal'.padEnd(12)} ${pad('cat ms', 10)} ${pad('MB/s', 8)} ${pad('Ctrl+C→PONG ms', 16)} ${pad('cpu s', 8)} ${pad('peak mem MB', 12)}`);
+    console.log(`  ${'terminal'.padEnd(14)} ${pad('cat ms', 10)} ${pad('MB/s', 8)} ${pad('Ctrl+C→PONG ms', 16)} ${pad('cpu s', 8)} ${pad('peak mem MB', 12)}`);
     console.log('  ' + '─'.repeat(82));
-    console.log(`  ${'xterm'.padEnd(12)} ${pad(x.catMs, 10)} ${pad(summary.xterm.MBps, 8)} ${pad(xi.interruptMs, 16)} ${pad(x.cpuTotal, 8)} ${pad(x.peakMemMB, 12)}`);
-    console.log(`  ${'ghostty'.padEnd(12)} ${pad(g.catMs, 10)} ${pad(summary.ghostty.MBps, 8)} ${pad(gi.interruptMs, 16)} ${pad(g.cpuTotal, 8)} ${pad(g.peakMemMB, 12)}`);
+    for (const backend of RUNNABLE) {
+      const r = perBackend[backend.resultKey];
+      console.log(`  ${backend.key.padEnd(14)} ${pad(r.catMs, 10)} ${pad(r.MBps, 8)} ${pad(r.interruptMs, 16)} ${pad(r.cpuTotal, 8)} ${pad(r.peakMemMB, 12)}`);
+    }
     console.log('  ' + '─'.repeat(82));
-    console.log(`  cat speedup: ${(x.catMs / g.catMs).toFixed(1)}×   interrupt speedup: ${(xi.interruptMs / gi.interruptMs).toFixed(1)}×`);
+    const base = perBackend[RUNNABLE[0].resultKey];
+    for (const backend of RUNNABLE.slice(1)) {
+      const r = perBackend[backend.resultKey];
+      console.log(`  ${backend.key} vs ${RUNNABLE[0].key} — cat: ${(base.catMs / r.catMs).toFixed(1)}×   interrupt: ${(base.interruptMs / r.interruptMs).toFixed(1)}×`);
+    }
     console.log('═'.repeat(86));
 
-    const resultsDir = path.join(__dirname, '..', 'results');
     fs.mkdirSync(resultsDir, { recursive: true });
     fs.writeFileSync(path.join(resultsDir, 'pty-bench.json'), JSON.stringify(summary, null, 2));
 

@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>xterm.js WebGL baseline</title>
+  <title>DOM terminal flood</title>
   <style>body { margin: 0; background: #1e1e1e; }</style>
 </head>
 <body>
@@ -10,42 +10,41 @@
   <script>
     const { ipcRenderer } = require('electron');
     const fs = require('fs');
-    const path = require('path');
-
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = path.join(__dirname, '..', 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css');
-    document.head.appendChild(link);
-
-    const { Terminal } = require('@xterm/xterm');
-    const { WebglAddon } = require('@xterm/addon-webgl');
-
-    let term;
-    try {
-      term = new Terminal({ cols: 120, rows: 30, scrollback: 1000 });
-      term.open(document.getElementById('terminal'));
-      const webgl = new WebglAddon();
-      term.loadAddon(webgl);
-      webgl.onContextLoss(() => ipcRenderer.send('bench-error', 'WebGL context lost'));
-    } catch (err) {
-      ipcRenderer.send('bench-error', 'terminal init failed: ' + err.message);
-      throw err;
-    }
-
-    let frames = 0;
-    term.onRender(() => frames++);
+    const createTerminal = require('./dom-terminal');
 
     const CHUNK_SIZE = 64 * 1024;
 
-    ipcRenderer.on('start', async (event, { payloadPath, repeat }) => {
+    ipcRenderer.on('start', async (event, { payloadPath, repeat, backend }) => {
       try {
-        const data = fs.readFileSync(payloadPath, 'latin1');
-        const t0 = performance.now();
+        const wrapper = await createTerminal(backend, {
+          cols: 120, rows: 30, scrollback: 1000,
+          container: document.getElementById('terminal')
+        });
+        const { term, writeChunk } = wrapper;
+        wrapper.onContextLoss(() => ipcRenderer.send('bench-error', 'WebGL context lost'));
 
+        // xterm.js fires onRender per drawn frame. ghostty-web declares the
+        // event but never fires it (its canvas renderer paints inside its own
+        // rAF loop) — count compositor ticks during the feed instead; its
+        // renderer paints every dirty frame, so rAF ticks ≈ presented frames.
+        let frames = 0;
+        let counting = true;
+        if (backend.syncWrite) {
+          const tick = () => { if (!counting) return; frames++; requestAnimationFrame(tick); };
+          requestAnimationFrame(tick);
+        } else {
+          term.onRender(() => frames++);
+        }
+
+        // ghostty-web's write() takes bytes directly; xterm.js takes strings
+        // (same latin1 conversion its harness always used).
+        const raw = fs.readFileSync(payloadPath);
+        const data = backend.syncWrite ? raw : raw.toString('latin1');
+
+        const t0 = performance.now();
         for (let r = 0; r < repeat; r++) {
           for (let off = 0; off < data.length; off += CHUNK_SIZE) {
-            const chunk = data.slice(off, off + CHUNK_SIZE);
-            await new Promise(resolve => term.write(chunk, resolve));
+            await writeChunk(data.slice(off, off + CHUNK_SIZE));
           }
         }
         const parseMs = performance.now() - t0;
@@ -55,6 +54,7 @@
         // frame reached the compositor.
         await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
         const e2eMs = performance.now() - t0;
+        counting = false;
 
         const totalBytes = data.length * repeat;
         ipcRenderer.send('done', {

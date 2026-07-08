@@ -1,9 +1,9 @@
 'use strict';
 /**
- * Parser benchmark — plain Node, no Electron, no GUI: runs on every OS.
+ * Parser suite — plain Node, no Electron, no GUI: runs on every OS.
  *
- * Feeds the identical byte stream through three VT engines, timing parse +
- * terminal state maintenance only. This isolates the component the
+ * Feeds the identical byte stream through every backend's VT engine, timing
+ * parse + terminal state maintenance only. This isolates the component the
  * architecture comparison hinges on:
  *
  *   xterm.js headless — the emulator VS Code ships (terminal logic in JS)
@@ -20,7 +20,7 @@
  * path — base64 WASM over Node's `fetch` — runs in plain Node. If it can't
  * load on some runner, the benchmark degrades to the xterm-vs-native pair.
  *
- * Usage: node scripts/bench-parse.js [--mb N] [--runs N]
+ * Usage: node bench/run.js parse [--mb N] [--runs N]
  */
 const fs = require('fs');
 const path = require('path');
@@ -100,7 +100,7 @@ function median(runs) {
   return runs[Math.floor(runs.length / 2)];
 }
 
-(async () => {
+module.exports = async function run() {
   let ghosttyWeb = null;
   if (GhosttyWeb) {
     try {
@@ -161,4 +161,6 @@ function median(runs) {
   const resultsDir = path.join(__dirname, '..', 'results');
   fs.mkdirSync(resultsDir, { recursive: true });
   fs.writeFileSync(path.join(resultsDir, 'parse.json'), JSON.stringify(out, null, 2));
-})();
+};
+
+if (require.main === module) module.exports();

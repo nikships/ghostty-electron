@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="UTF-8">
-  <title>xterm pty-bench</title>
+  <title>DOM terminal pty-bench</title>
   <style>
     * { margin: 0; padding: 0; }
     body { background: #0d1117; height: 100vh; display: flex; align-items: center; justify-content: center; overflow: hidden; }
@@ -12,17 +12,10 @@
   <div id="terminal"></div>
   <script>
     const { ipcRenderer } = require('electron');
-    const path = require('path');
-
-    const link = document.createElement('link');
-    link.rel = 'stylesheet';
-    link.href = path.join(__dirname, '..', 'node_modules', '@xterm', 'xterm', 'css', 'xterm.css');
-    document.head.appendChild(link);
-
-    const { Terminal } = require('@xterm/xterm');
-    const { WebglAddon } = require('@xterm/addon-webgl');
+    const createTerminal = require('./dom-terminal');
 
     let term;
+    let syncWrite = false;
     let parsedBytes = 0;
     let lastAckSent = 0;
     let watchMarker = null;
@@ -35,24 +28,29 @@
 
     let debugScans = 0;
     let watchDepth = 0; // 0 = viewport endsWith; >0 = last N buffer lines, includes
+    // Bottom-pinned viewport base. xterm.js exposes it as baseY; ghostty-web's
+    // compat shim reports baseY/viewportY as 0, but its buffer length includes
+    // scrollback — length - rows is the same quantity in both libraries.
+    const viewportBase = (buf) => Math.max(0, buf.length - term.rows);
     function scanForMarker() {
       if (!watchMarker || !term) return;
       const t = performance.now();
       if (t - lastScan < scanIntervalMs) return;
       lastScan = t;
       const buf = term.buffer.active;
+      const base = viewportBase(buf);
       if (++debugScans % 40 === 0) {
         const tail = [];
         for (let i = Math.max(0, term.rows - 3); i < term.rows; i++) {
-          const l = buf.getLine(buf.viewportY + i);
+          const l = buf.getLine(base + i);
           tail.push(l ? l.translateToString(true) : '<null>');
         }
-        ipcRenderer.send('x-debug', { viewportY: buf.viewportY, baseY: buf.baseY, tail });
+        ipcRenderer.send('x-debug', { base, length: buf.length, tail });
       }
       if (watchDepth > 0) {
         // Deep scan for the latency probe: under a flood the echo scrolls out
         // of the viewport within milliseconds — look at recent history too.
-        const total = buf.baseY + term.rows;
+        const total = buf.length;
         for (let i = Math.max(0, total - watchDepth); i < total; i++) {
           const line = buf.getLine(i);
           if (line && line.translateToString(true).includes(watchMarker)) {
@@ -68,7 +66,7 @@
         return;
       }
       for (let i = 0; i < term.rows; i++) {
-        const line = buf.getLine(buf.viewportY + i);
+        const line = buf.getLine(base + i);
         if (line && line.translateToString(true).trim().endsWith(watchMarker)) {
           const marker = watchMarker;
           watchMarker = null;
@@ -84,21 +82,37 @@
       }
     }
 
-    ipcRenderer.on('x-config', (event, { cols, rows, fontSize }) => {
-      term = new Terminal({
-        cols, rows, fontSize,
-        fontFamily: 'Menlo, monospace',
-        scrollback: 10000,
-        theme: { background: '#1e1e1e' }
-      });
-      term.open(document.getElementById('terminal'));
-      term.loadAddon(new WebglAddon());
-      term.onData((d) => ipcRenderer.send('x-input', d));
-      term.onRender(scanForMarker);
-      term.focus();
+    ipcRenderer.on('x-config', async (event, { cols, rows, fontSize, backend }) => {
+      try {
+        const wrapper = await createTerminal(backend, {
+          cols, rows, fontSize, scrollback: 10000,
+          container: document.getElementById('terminal')
+        });
+        term = wrapper.term;
+        syncWrite = backend.syncWrite;
+        term.onData((d) => ipcRenderer.send('x-input', d));
+        term.onRender(scanForMarker);
+        term.focus();
+        ipcRenderer.send('x-term-up');
+      } catch (err) {
+        ipcRenderer.send('x-term-error', err.message + '\n' + err.stack);
+      }
     });
 
     ipcRenderer.on('x-data', (event, d) => {
+      if (syncWrite) {
+        // ghostty-web parses synchronously; its write callback is rAF-deferred
+        // (frame cadence, not parse completion) — ack as soon as write
+        // returns, which is when the bytes actually are parsed.
+        term.write(d);
+        parsedBytes += d.length;
+        if (parsedBytes - lastAckSent > 1024 * 1024) {
+          lastAckSent = parsedBytes;
+          ipcRenderer.send('x-acked', parsedBytes);
+        }
+        scanForMarker();
+        return;
+      }
       term.write(d, () => {
         parsedBytes += d.length;
         // Flow control ack (VS Code-style): tell main how much we've parsed.

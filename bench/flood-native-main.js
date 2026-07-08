@@ -1,20 +1,23 @@
 'use strict';
 /**
- * libghostty + sharedTexture: cat a payload through libghostty-vt in the
- * main process, render the grid natively into an IOSurface (CoreText,
- * HiDPI-scaled, dirty-row incremental), and present it in a sandboxed
- * renderer <canvas> via Electron's sharedTexture module.
+ * In-terminal flood, native backend — libghostty + sharedTexture: cat a
+ * payload through libghostty-vt in the main process, render the grid
+ * natively into an IOSurface (CoreText, HiDPI-scaled, dirty-row
+ * incremental), and present it in a sandboxed renderer <canvas> via
+ * Electron's sharedTexture module.
  *
  * Measures per stage: write (parse), render (native draw), send (import +
  * transfer), and per-frame present latency (send → consumer double-rAF ack).
  * e2e = first byte fed → final frame presented.
  *
- * Flags: --repeat N (sustained mode, feeds the payload N times),
- *        --screenshot (dump final frame to results/).
+ * Usage: electron bench/flood-native-main.js [--repeat N] [--screenshot]
  */
 const { app, BrowserWindow, ipcMain, screen, sharedTexture } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { byKey } = require('./backends');
+
+const backend = byKey('ghostty');
 
 const addon = require(path.join(__dirname, '..', 'native', 'build', 'Release', 'ghostty_producer.node'));
 if (typeof addon.render !== 'function') {
@@ -67,7 +70,7 @@ app.whenReady().then(async () => {
     webPreferences: {
       sandbox: true,
       backgroundThrottling: false,
-      preload: path.join(__dirname, 'preload.js')
+      preload: path.join(__dirname, 'consumer-preload.js')
     }
   });
 
@@ -148,7 +151,7 @@ app.whenReady().then(async () => {
       presentLatencies.sort((a, b) => a - b);
       const totalBytes = data.length * REPEAT;
       const out = {
-        backend: 'libghostty-vt + native IOSurface producer + sharedTexture',
+        backend: backend.name,
         mode: REPEAT > 1 ? 'sustained' : 'burst',
         repeat: REPEAT,
         payloadBytes: totalBytes,
@@ -173,7 +176,7 @@ app.whenReady().then(async () => {
       console.log(JSON.stringify(out, null, 2));
       const resultsDir = path.join(__dirname, '..', 'results');
       fs.mkdirSync(resultsDir, { recursive: true });
-      fs.writeFileSync(path.join(resultsDir, 'ghostty.json'), JSON.stringify(out, null, 2));
+      fs.writeFileSync(path.join(resultsDir, backend.resultFile), JSON.stringify(out, null, 2));
       if (process.argv.includes('--screenshot')) {
         const img = await win.webContents.capturePage();
         fs.writeFileSync(path.join(resultsDir, 'ghostty-frame.png'), img.toPNG());

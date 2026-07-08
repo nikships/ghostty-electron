@@ -29,11 +29,14 @@ const METRICS = [
   ['parse.json', 'parse: ghostty MB/s', (r) => r.ghostty.MBps, false],
   ['parse.json', 'parse: ghostty-web MB/s', (r) => r.ghosttyWeb?.MBps, false],
   ['parse.json', 'parse: xterm MB/s', (r) => r.xterm.MBps, false],
-  ['summary.json', 'in-terminal sustained: ghostty e2e ms', (r) => r.sustained?.ghostty.e2eMs, true],
-  ['summary.json', 'in-terminal sustained: xterm e2e ms', (r) => r.sustained?.xterm.e2eMs, true],
+  ['summary.json', 'in-terminal sustained: ghostty e2e ms', (r) => r.sustained?.ghostty?.e2eMs, true],
+  ['summary.json', 'in-terminal sustained: ghostty-web e2e ms', (r) => r.sustained?.ghosttyWeb?.e2eMs, true],
+  ['summary.json', 'in-terminal sustained: xterm e2e ms', (r) => r.sustained?.xterm?.e2eMs, true],
   ['pty-bench.json', 'pty race: ghostty cat ms', (r) => r.ghostty?.catMs, true],
+  ['pty-bench.json', 'pty race: ghostty-web cat ms', (r) => r.ghosttyWeb?.catMs, true],
   ['pty-bench.json', 'pty race: xterm cat ms', (r) => r.xterm?.catMs, true],
   ['pty-bench.json', 'pty race: ghostty interrupt ms', (r) => r.ghostty?.interruptMs, true],
+  ['pty-bench.json', 'pty race: ghostty-web interrupt ms', (r) => r.ghosttyWeb?.interruptMs, true],
   ['pty-bench.json', 'pty race: xterm interrupt ms', (r) => r.xterm?.interruptMs, true],
 ];
 

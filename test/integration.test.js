@@ -26,8 +26,10 @@ const MAC = process.platform === 'darwin' ? {} : { skip: 'requires the macOS pro
 function runElectron(args, timeout = 120_000) {
   // Capture stdout/stderr so a crash inside Electron isn't a black box in CI.
   // execFileSync attaches them to the thrown error only when they're piped.
+  // Only resolve args that reference repo files (entry points contain a
+  // slash); flag values like `--backend xterm` must pass through untouched.
   try {
-    execFileSync(electron, args.map(a => path.isAbsolute(a) || a.startsWith('--') || /^\d+$/.test(a) ? a : path.join(ROOT, a)), {
+    execFileSync(electron, args.map(a => !path.isAbsolute(a) && a.includes('/') ? path.join(ROOT, a) : a), {
       cwd: ROOT,
       stdio: ['ignore', 'pipe', 'pipe'],
       encoding: 'utf8',
@@ -52,8 +54,8 @@ test('payload exists (generate if missing)', () => {
   assert.ok(size > 1024 * 1024 - 1024, 'payload is ~1MiB');
 });
 
-test('xterm benchmark runs and reports sane numbers', () => {
-  runElectron(['xterm-bench/main.js']);
+test('xterm flood benchmark runs and reports sane numbers', () => {
+  runElectron(['bench/flood-dom-main.js', '--backend', 'xterm']);
   const r = readResult('xterm.json');
   assert.strictEqual(r.mode, 'burst');
   assert.ok(r.payloadBytes > 1_000_000);
@@ -63,8 +65,18 @@ test('xterm benchmark runs and reports sane numbers', () => {
   assert.ok(r.scale >= 1, 'reports devicePixelRatio');
 });
 
+test('ghostty-web flood benchmark runs and reports sane numbers', () => {
+  runElectron(['bench/flood-dom-main.js', '--backend', 'ghostty-web']);
+  const r = readResult('ghostty-web.json');
+  assert.strictEqual(r.mode, 'burst');
+  assert.ok(r.payloadBytes > 1_000_000);
+  assert.ok(r.parseMs > 0 && r.parseMs < 10_000, `parseMs sane (${r.parseMs})`);
+  assert.ok(r.e2eMs >= r.parseMs, 'e2e includes parse');
+  assert.ok(r.frames > 0, 'rendered frames');
+});
+
 test('ghostty benchmark runs, reports per-stage stats and a real screenshot', MAC, () => {
-  runElectron(['ghostty-bench/main.js', '--screenshot']);
+  runElectron(['bench/flood-native-main.js', '--screenshot']);
   const r = readResult('ghostty.json');
   assert.strictEqual(r.mode, 'burst');
   assert.ok(r.parseMs > 0 && r.e2eMs >= r.parseMs);
@@ -78,7 +90,7 @@ test('ghostty benchmark runs, reports per-stage stats and a real screenshot', MA
 });
 
 test('sustained mode (5× payload) completes', MAC, () => {
-  runElectron(['ghostty-bench/main.js', '--repeat', '5'], 180_000);
+  runElectron(['bench/flood-native-main.js', '--repeat', '5'], 180_000);
   const r = readResult('ghostty.json');
   assert.strictEqual(r.mode, 'sustained');
   assert.strictEqual(r.repeat, 5);
@@ -87,11 +99,11 @@ test('sustained mode (5× payload) completes', MAC, () => {
 });
 
 test('pty-bench: sentinel-timed cat race completes with sane metrics', MAC, () => {
-  runElectron(['pty-bench/main.js', '--mb', '8', '--interrupt-ms', '500'], 180_000);
+  runElectron(['bench/pty-main.js', '--mb', '8', '--interrupt-ms', '500'], 300_000);
   const r = readResult('pty-bench.json');
   assert.ok(Math.abs(r.sizeMB - 8) < 1, 'ran the 8 MiB payload');
   assert.ok(r.pipeCeiling.MBps > 1, 'pipe ceiling measured');
-  for (const key of ['ghostty', 'xterm']) {
+  for (const key of ['ghostty', 'ghosttyWeb', 'xterm']) {
     const t = r[key];
     assert.ok(t.catMs > 0 && t.catMs < 120_000, `${key} cat completed (${t.catMs}ms)`);
     assert.ok(t.MBps > 0.5, `${key} throughput sane`);
