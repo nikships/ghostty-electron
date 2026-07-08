@@ -6,6 +6,14 @@ on:
   pull_request:
   workflow_dispatch:
 
+# gh run list/download in the "Compare with previous main run" step query the
+# Actions API, which needs actions:read. Without an explicit block the token
+# inherits a restricted default and returns "HTTP 403: Resource not accessible
+# by integration". contents:read covers actions/checkout.
+permissions:
+  contents: read
+  actions: read
+
 jobs:
   macos:
     name: macOS (full suite + benchmarks)
