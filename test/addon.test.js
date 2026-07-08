@@ -139,6 +139,21 @@ test('dirty-row tracking survives double buffering', RENDER, () => {
   assert.ok(f.rowsDrawn < 24, `incremental redraw expected (got ${f.rowsDrawn}/24)`);
 });
 
+// Regression: a non-ASCII cell goes through the CTLine path, which mutates the
+// context text matrix. If it isn't reset, the batched CTFontDrawGlyphs runs for
+// every LATER row draw off-surface and render blank — htop's process list and
+// F-bar buttons showed as empty until an unrelated repaint (the "blank buttons"
+// bug). A non-ASCII glyph on row 0 must not suppress ASCII text on row 5.
+test('non-ASCII glyph does not blank later rows (text-matrix leak)', RENDER, () => {
+  const t = makeTerm();
+  write(t, '▽');               // row 0: ▽ (non-ASCII → CTLine path)
+  write(t, '\x1b[6;1H\x1b[37mMMMM'); // row 5: white ASCII text via batched path
+  addon.render(t.session);
+  const px = addon.readPixels(t.session);
+  const light = countPixels(t, px, 1, 5, (r, g, b) => r > 150 && g > 150 && b > 150);
+  assert.ok(light > 5, `row 5 ASCII text must render after a non-ASCII cell (got ${light} light px)`);
+});
+
 test('scrollback: wheel scrolling moves the viewport', () => {
   const t = makeTerm(80, 24);
   for (let i = 1; i <= 50; i++) write(t, `line-${i}\r\n`);

@@ -442,6 +442,14 @@ static void draw_row(Session *s, CGContextRef ctx, int row_index,
       CTLineRef line = CTLineCreateWithAttributedString(astr);
       CGContextSetTextPosition(ctx, c * s->cell_w, baseline);
       CTLineDraw(line, ctx);
+      // CTLineDraw leaves the context's text matrix set to whatever the run's
+      // font implies. The batched ASCII path (CTFontDrawGlyphs) draws with the
+      // CURRENT text matrix and sets none of its own, so a leaked non-identity
+      // matrix from one non-ASCII cell sends every later glyph run in the frame
+      // off-surface — the whole process list and F-bar rendered blank the
+      // instant a row contained a single non-ASCII glyph (htop's ▽ sort mark).
+      // Reset to identity so subsequent runs position correctly.
+      CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
       CFRelease(line);
       CFRelease(astr);
       CFRelease(attrs);
