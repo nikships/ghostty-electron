@@ -24,8 +24,13 @@ if (parse) {
   console.log('| parser | ms | MB/s |');
   console.log('|---|---|---|');
   console.log(`| xterm.js headless | ${parse.xterm.ms} | ${parse.xterm.MBps} |`);
-  console.log(`| libghostty-vt | ${parse.ghostty.ms} | ${parse.ghostty.MBps} |`);
-  console.log(`\n**speedup: ${parse.speedup}×**\n`);
+  if (parse.ghosttyWeb)
+    console.log(`| ghostty-web (WASM) | ${parse.ghosttyWeb.ms} | ${parse.ghosttyWeb.MBps} |`);
+  console.log(`| libghostty-vt (native) | ${parse.ghostty.ms} | ${parse.ghostty.MBps} |`);
+  console.log(`\n**libghostty-vt vs xterm.js: ${parse.speedup}×**`);
+  if (parse.ghosttyWeb)
+    console.log(` · ghostty-web vs xterm.js: ${parse.ghosttyWebSpeedup}× · native vs WASM (same engine): ${parse.wasmVsNative}×`);
+  console.log('');
 }
 
 if (summary) {

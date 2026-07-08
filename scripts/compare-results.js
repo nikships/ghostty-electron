@@ -27,6 +27,7 @@ if (!prevDir || !fs.existsSync(prevDir)) {
 // metric extractors: [file, label, path-fn, lower-is-better]
 const METRICS = [
   ['parse.json', 'parse: ghostty MB/s', (r) => r.ghostty.MBps, false],
+  ['parse.json', 'parse: ghostty-web MB/s', (r) => r.ghosttyWeb?.MBps, false],
   ['parse.json', 'parse: xterm MB/s', (r) => r.xterm.MBps, false],
   ['summary.json', 'in-terminal sustained: ghostty e2e ms', (r) => r.sustained?.ghostty.e2eMs, true],
   ['summary.json', 'in-terminal sustained: xterm e2e ms', (r) => r.sustained?.xterm.e2eMs, true],

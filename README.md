@@ -48,17 +48,38 @@ commands shown; raw JSON lands in `results/`.
 
 ### 1. Parser only — `npm run bench:parse` (any OS, no GUI)
 
-The identical byte stream through both VT engines in plain Node:
+The identical byte stream through three VT engines in plain Node:
 
-| | xterm.js headless | libghostty-vt | ratio |
-|---|---|---|---|
-| macOS arm64 (M-series) | 20.1 MB/s | 219.3 MB/s | **10.9×** |
-| Windows x64 (CI runner) | 4.0 MB/s | 98.5 MB/s | **24.4×** |
+| | xterm.js headless | ghostty-web (WASM) | libghostty-vt (native) | native vs xterm |
+|---|---|---|---|---|
+| macOS arm64 (M-series) | 19.7 MB/s | 58.4 MB/s | 237.2 MB/s | **12.0×** |
+| Windows x64 (CI runner) | 4.0 MB/s | *see CI* | 98.5 MB/s | **24.4×** |
 
-The gap *widens* on Windows: the native parser loses less to the slower
-hardware than the JS one does. (Windows numbers come from the GitHub-hosted
-runner via CI — see any run's job summary; the Windows xterm-in-Electron
-baseline also runs there: 1 MiB burst ≈ 423 ms e2e.)
+Three engines, two of them the *same* ghostty parser:
+[coder/ghostty-web](https://github.com/coder/ghostty-web) compiles ghostty's
+VT engine to **WASM** with an xterm.js-compatible API (it's what the Mux
+desktop app ships); libghostty-vt runs that same engine **natively** through
+an N-API addon. So the three rows separate two effects cleanly:
+
+- **engine** — ghostty-web is already **3.0× xterm.js** on the same payload,
+  purely from swapping the JS emulator for ghostty's, before any native code
+  is involved.
+- **sandbox** — native libghostty-vt is a further **4.1×** over ghostty-web:
+  the cost of the WASM boundary (bulk `write` copies into WASM linear memory,
+  no SIMD/threads) on an otherwise identical parser.
+
+The native-vs-xterm gap *widens* on Windows: the native parser loses less to
+the slower hardware than the JS one does. (Windows numbers come from the
+GitHub-hosted runner via CI — see any run's job summary, which now includes
+the ghostty-web row too; the Windows xterm-in-Electron baseline also runs
+there: 1 MiB burst ≈ 423 ms e2e.)
+
+ghostty-web ships for the browser — its default loader reaches for
+`self.location` — so the benchmark shims that one global and drives its
+headless `Ghostty.load()` / `createTerminal().write()` path (base64 WASM over
+Node's `fetch`), feeding it the identical byte chunks the native addon gets.
+If the WASM can't load on some runner, the harness logs it and falls back to
+the xterm-vs-native pair.
 
 ### 2. In-terminal flood — `npm run bench` (Electron, macOS)
 
