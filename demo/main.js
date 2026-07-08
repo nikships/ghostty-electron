@@ -433,13 +433,25 @@ app.whenReady().then(async () => {
         path.join(resultsDir, 'demo-smoke.json'),
         JSON.stringify({ ghosttyEcho, xtermEcho, marker: MARKER }, null, 2)
       );
-      const gImg = await ghosttyWin.webContents.capturePage();
-      fs.writeFileSync(path.join(resultsDir, 'demo-ghostty.png'), gImg.toPNG());
-      const xImg = await xtermWin.webContents.capturePage();
-      fs.writeFileSync(path.join(resultsDir, 'demo-xterm.png'), xImg.toPNG());
 
-      console.log(JSON.stringify({ ghosttyEcho, xtermEcho }));
-      app.exit(ghosttyEcho && xtermEcho ? 0 : 1);
+      // Screenshots are diagnostics, but capturePage() is GPU-dependent and can
+      // reject on headless CI runners. A rejection here must NOT turn a passing
+      // echo round-trip into a crash exit — capture defensively and retry once.
+      let shotOk = false;
+      for (let attempt = 0; attempt < 2 && !shotOk; attempt++) {
+        try {
+          const gImg = await ghosttyWin.webContents.capturePage();
+          fs.writeFileSync(path.join(resultsDir, 'demo-ghostty.png'), gImg.toPNG());
+          const xImg = await xtermWin.webContents.capturePage();
+          fs.writeFileSync(path.join(resultsDir, 'demo-xterm.png'), xImg.toPNG());
+          shotOk = true;
+        } catch (err) {
+          console.error(`capturePage failed (attempt ${attempt + 1}): ${err && err.message}`);
+        }
+      }
+
+      console.log(JSON.stringify({ ghosttyEcho, xtermEcho, shotOk }));
+      app.exit(ghosttyEcho && xtermEcho && shotOk ? 0 : 1);
     }, 500);
   }
 });

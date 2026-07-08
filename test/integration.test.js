@@ -24,11 +24,20 @@ const electron = require('electron');
 const MAC = process.platform === 'darwin' ? {} : { skip: 'requires the macOS producer' };
 
 function runElectron(args, timeout = 120_000) {
-  execFileSync(electron, args.map(a => path.isAbsolute(a) || a.startsWith('--') || /^\d+$/.test(a) ? a : path.join(ROOT, a)), {
-    cwd: ROOT,
-    stdio: ['ignore', 'ignore', 'ignore'],
-    timeout
-  });
+  // Capture stdout/stderr so a crash inside Electron isn't a black box in CI.
+  // execFileSync attaches them to the thrown error only when they're piped.
+  try {
+    execFileSync(electron, args.map(a => path.isAbsolute(a) || a.startsWith('--') || /^\d+$/.test(a) ? a : path.join(ROOT, a)), {
+      cwd: ROOT,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8',
+      timeout
+    });
+  } catch (err) {
+    const out = [err.stdout, err.stderr].filter(Boolean).join('\n').trim();
+    if (out) err.message += `\n--- Electron output ---\n${out}`;
+    throw err;
+  }
 }
 
 function readResult(file) {
