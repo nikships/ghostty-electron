@@ -6,8 +6,12 @@
  * compare the feel; run `cat payload.txt`, `find /`, vim, less, etc.
  *
  * Flags:
- *   --smoke  echo a marker through both PTYs, verify both grids show it,
- *            write results/demo-smoke.json (+ screenshots) and exit.
+ *   --smoke        echo a marker through both PTYs, verify both grids show
+ *                  it, write results/demo-smoke.json (+ screenshots), exit.
+ *   --mouse-smoke  run `cat -v` in the PTY with SGR mouse tracking enabled,
+ *                  synthesize real clicks/drag/wheel via sendInputEvent and
+ *                  verify the app received the right escape sequences;
+ *                  write results/demo-mouse-smoke.json and exit.
  */
 const { app, BrowserWindow, clipboard, ipcMain, screen, shell, sharedTexture } = require('electron');
 const path = require('path');
@@ -24,6 +28,7 @@ const COLS = 120;
 const ROWS = 30;
 const FONT_SIZE = 13;
 const SMOKE = process.argv.includes('--smoke');
+const MOUSE_SMOKE = process.argv.includes('--mouse-smoke');
 const SHELL = process.platform === 'win32' ? 'powershell.exe' : (process.env.SHELL || '/bin/zsh');
 
 function spawnShell(cols, rows) {
@@ -158,18 +163,19 @@ app.whenReady().then(async () => {
 
   function sendInit() {
     if (ghosttyWin.isDestroyed()) return;
-    ghosttyWin.webContents.send('init', {
-      cssWidth: cssW,
-      cssHeight: cssH,
-      cellWidth: cellCssW,
-      cellHeight: cellCssH
-    });
+    ghosttyWin.webContents.send('init', { cssWidth: cssW, cssHeight: cssH });
   }
 
   ipcMain.on('renderer-ready', () => {
     sendInit();
     if (!presentTimer) presentTimer = setInterval(presentTick, 8);
   });
+
+  // Canvas position (CSS px, window-relative), reported by the renderer
+  // after each init (it moves when the window resizes); used to aim
+  // synthesized input in --mouse-smoke.
+  let canvasRect = null;
+  ipcMain.on('canvas-rect', (event, r) => { canvasRect = r; });
 
   // Auto-resize: derive cols/rows from the window's content area and the fixed
   // cell size, then resize the terminal (reallocates IOSurfaces), the PTY, and
@@ -226,28 +232,84 @@ app.whenReady().then(async () => {
     if (text) ptyG.write(text);
   });
 
-  // Mouse selection: anchor on mousedown, extend on drag, keep on mouseup.
-  let selAnchor = null;
-  ipcMain.on('g-sel', (event, { phase, x, y }) => {
-    const cx = Math.max(0, Math.min(cols - 1, x));
-    const cy = Math.max(0, Math.min(rows - 1, y));
-    if (phase === 'start') {
-      selAnchor = { x: cx, y: cy };
-      clearSelection();
-    } else if (selAnchor && (phase === 'drag' || phase === 'end')) {
-      if (phase === 'end' && cx === selAnchor.x && cy === selAnchor.y && !hasSelection) {
-        clearSelection(); // click without drag
+  /* ── mouse: app tracking vs local selection ──────────────────────────
+   * Events arrive with canvas-relative CSS pixel coords. When the PTY app
+   * enabled mouse tracking (htop, vim :set mouse=a, …) we encode via
+   * libghostty — encodeMouse reads the tracking/format modes off the
+   * terminal and returns the right escape sequence (or nothing) — and
+   * write it to the PTY. Shift bypasses tracking for local selection,
+   * the universal terminal convention. Cmd+click always opens links. */
+  const DOM_TO_GHOSTTY_BUTTON = [1, 3, 2, 8, 9]; // left, middle, right, back, forward
+  const toPx = (css) => css * scale; // CSS px → surface px
+  const cellOf = (m) => ({
+    x: Math.max(0, Math.min(cols - 1, Math.floor(toPx(m.cssX) / term.cellWidth))),
+    y: Math.max(0, Math.min(rows - 1, Math.floor(toPx(m.cssY) / term.cellHeight)))
+  });
+  const sendMouse = (m, action, button) => {
+    try {
+      const bytes = addon.encodeMouse(term.session, {
+        action,
+        button,
+        x: toPx(m.cssX),
+        y: toPx(m.cssY),
+        shift: m.shift,
+        ctrl: m.ctrl,
+        alt: m.alt
+      });
+      if (bytes.length > 0) ptyG.write(bytes.toString('binary'));
+    } catch {}
+  };
+
+  let selAnchor = null;       // local selection drag anchor
+  let appDragButton = -1;     // ghostty button held while app tracking owns the drag
+  ipcMain.on('g-mouse', (event, m) => {
+    let tracking = false;
+    try { tracking = addon.getMouseState(term.session).tracking; } catch {}
+    const appOwns = tracking && !m.shift;
+
+    if (m.type === 'down') {
+      if (m.meta && m.button === 0) { openLinkAt(cellOf(m)); return; }
+      if (appOwns) {
+        appDragButton = DOM_TO_GHOSTTY_BUTTON[m.button] ?? 0;
+        sendMouse(m, 'press', appDragButton);
         return;
       }
-      // Order anchor/point so start ≤ end (backward drags).
-      let [s0, s1] = [selAnchor, { x: cx, y: cy }];
-      if (s1.y < s0.y || (s1.y === s0.y && s1.x < s0.x)) [s0, s1] = [s1, s0];
-      try {
-        addon.setSelection(term.session, s0.x, s0.y, s1.x, s1.y);
-        hasSelection = true;
-      } catch {}
+      if (m.button !== 0) return;
+      selAnchor = cellOf(m);
+      clearSelection();
+    } else if (m.type === 'move') {
+      if (appDragButton >= 0) { sendMouse(m, 'motion', appDragButton); return; }
+      if (tracking && !m.buttons) { sendMouse(m, 'motion', -1); return; } // any-event mode (1003)
+      if (!selAnchor || !(m.buttons & 1)) return;
+      dragSelection(cellOf(m), false);
+    } else if (m.type === 'up') {
+      if (appDragButton >= 0) {
+        sendMouse(m, 'release', appDragButton);
+        appDragButton = -1;
+        return;
+      }
+      if (!selAnchor) return;
+      dragSelection(cellOf(m), true);
+      selAnchor = null;
+    } else if (m.type === 'dblclick') {
+      if (appOwns) return; // press/release pair already reported
+      selectWordAt(cellOf(m));
     }
   });
+
+  function dragSelection({ x: cx, y: cy }, isEnd) {
+    if (isEnd && cx === selAnchor.x && cy === selAnchor.y && !hasSelection) {
+      clearSelection(); // click without drag
+      return;
+    }
+    // Order anchor/point so start ≤ end (backward drags).
+    let [s0, s1] = [selAnchor, { x: cx, y: cy }];
+    if (s1.y < s0.y || (s1.y === s0.y && s1.x < s0.x)) [s0, s1] = [s1, s0];
+    try {
+      addon.setSelection(term.session, s0.x, s0.y, s1.x, s1.y);
+      hasSelection = true;
+    } catch {}
+  }
 
   ipcMain.on('g-copy', () => {
     try {
@@ -273,19 +335,19 @@ app.whenReady().then(async () => {
   }, 530);
 
   // Double-click word selection (ghostty's own word-boundary rules).
-  ipcMain.on('g-selword', (event, { x, y }) => {
+  function selectWordAt({ x, y }) {
     try {
-      const text = addon.selectWord(term.session,
-        Math.max(0, Math.min(cols - 1, x)), Math.max(0, Math.min(rows - 1, y)));
+      // Coords are pre-clamped by cellOf.
+      const text = addon.selectWord(term.session, x, y);
       hasSelection = !!text;
     } catch {}
-  });
+  }
 
   // Cmd+click opens the URL under the pointer.
   const URL_RE = /https?:\/\/[^\s'"«»‹›]+/g;
-  ipcMain.on('g-link', (event, { x, y }) => {
+  function openLinkAt({ x, y }) {
     try {
-      const line = addon.getText(term.session)[Math.max(0, Math.min(rows - 1, y))] || '';
+      const line = addon.getText(term.session)[y] || ''; // y pre-clamped by cellOf
       for (const m of line.matchAll(URL_RE)) {
         if (x >= m.index && x < m.index + m[0].length) {
           shell.openExternal(m[0].replace(/[.,;:)\]]+$/, ''));
@@ -293,7 +355,7 @@ app.whenReady().then(async () => {
         }
       }
     } catch {}
-  });
+  }
 
   // IME: composed text arrives whole from the renderer's composition events.
   ipcMain.on('g-ime', (event, text) => {
@@ -339,12 +401,36 @@ app.whenReady().then(async () => {
   });
   ipcMain.on('g-search-close', () => { search = { query: '', matches: [], idx: -1 }; clearSelection(); });
 
+  /* Wheel, three ways (same arbitration as native terminals):
+   *  1. app enabled mouse tracking → wheel button 4/5 press events
+   *     (htop scrolls its process list, vim :set mouse=a scrolls buffers)
+   *  2. alt screen + mode 1007 (alternate scroll, default on) → arrow keys
+   *     (how less/man scroll without mouse support)
+   *  3. otherwise → our scrollback viewport, as before. */
   let scrollRemainder = 0;
-  ipcMain.on('g-wheel', (event, { deltaY }) => {
-    scrollRemainder += deltaY / (term.cellHeight / scale);
+  ipcMain.on('g-wheel', (event, m) => {
+    scrollRemainder += m.deltaY / (term.cellHeight / scale);
     const scrollRows = Math.trunc(scrollRemainder);
-    if (scrollRows !== 0) {
-      scrollRemainder -= scrollRows;
+    if (scrollRows === 0) return;
+    scrollRemainder -= scrollRows;
+
+    let state = { tracking: false, altScreen: false, altScroll: false };
+    try { state = addon.getMouseState(term.session); } catch {}
+
+    if (state.tracking && !m.shift) {
+      const button = scrollRows < 0 ? 4 : 5; // 4 = wheel up, 5 = wheel down
+      for (let i = 0; i < Math.min(Math.abs(scrollRows), 20); i++) {
+        sendMouse(m, 'press', button);
+      }
+    } else if (state.altScreen && state.altScroll) {
+      const code = scrollRows < 0 ? 'ArrowUp' : 'ArrowDown';
+      try {
+        const bytes = addon.encodeKey(term.session, { code });
+        for (let i = 0; i < Math.min(Math.abs(scrollRows), 20); i++) {
+          ptyG.write(bytes.toString('binary'));
+        }
+      } catch {}
+    } else {
       addon.scroll(term.session, scrollRows);
     }
   });
@@ -401,6 +487,88 @@ app.whenReady().then(async () => {
       fs.writeFileSync(path.join(__dirname, '..', 'results', `autotype-xterm-${i}.png`), xImg.toPNG());
       if (i === shots.length - 1) app.exit(0);
     }, ms));
+  }
+
+  /* ─── mouse smoke mode for integration tests ───────────────────────── */
+  // Full-path verification: OS-level input events synthesized into the real
+  // renderer (sendInputEvent) → preload listeners → IPC → encodeMouse →
+  // PTY → a raw-mode `cat -v` that prints what the app receives → grid.
+  // Asserts the app saw the exact SGR sequences a click/drag/wheel produce.
+  if (MOUSE_SMOKE) {
+    // Raw tty (no canonical buffering, no echo), enable button-event
+    // tracking + SGR as an app like vim would, then print received input.
+    setTimeout(() => {
+      ptyG.write(`stty -icanon -echo min 1 time 0; printf '\\033[?1002h\\033[?1006h'; cat -v\r`);
+    }, 1500);
+
+    const at = (cx, cy) => ({
+      x: Math.round(canvasRect.left + (cx + 0.5) * cellCssW),
+      y: Math.round(canvasRect.top + (cy + 0.5) * cellCssH)
+    });
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    // Join rows so sequences that soft-wrap across the 120-col boundary
+    // are still found.
+    const gridHas = (s) => {
+      try { return addon.getText(term.session).join('').includes(s); } catch { return false; }
+    };
+    const waitFor = async (pred, ms) => {
+      const end = Date.now() + ms;
+      while (Date.now() < end) {
+        if (pred()) return true;
+        await sleep(200);
+      }
+      return false;
+    };
+
+    (async () => {
+      const trackingEnabled = await waitFor(() => {
+        if (!canvasRect) return false;
+        try { return addon.getMouseState(term.session).tracking; } catch { return false; }
+      }, 25_000);
+      if (!canvasRect) canvasRect = { left: 0, top: 0 }; // still record results
+
+      const send = (ev) => ghosttyWin.webContents.sendInputEvent(ev);
+      const p = at(5, 3), q = at(10, 3);
+      // Click cell (5,3), drag to (10,3), release.
+      send({ type: 'mouseDown', x: p.x, y: p.y, button: 'left', clickCount: 1 });
+      await sleep(100);
+      send({ type: 'mouseMove', x: q.x, y: q.y });
+      await sleep(100);
+      send({ type: 'mouseUp', x: q.x, y: q.y, button: 'left', clickCount: 1 });
+      await sleep(100);
+      // Wheel both directions over cell (5,3) — one maps to button 4 (64),
+      // the other to button 5 (65).
+      send({ type: 'mouseWheel', x: p.x, y: p.y, deltaX: 0, deltaY: 100 });
+      await sleep(100);
+      send({ type: 'mouseWheel', x: p.x, y: p.y, deltaX: 0, deltaY: -100 });
+
+      // cat -v renders ESC as ^[ — cell (5,3) is SGR "6;4", (10,3) "11;4".
+      const results = {
+        trackingEnabled,
+        press: await waitFor(() => gridHas('^[[<0;6;4M'), 10_000),
+        drag: gridHas('^[[<32;11;4M'),
+        release: gridHas('^[[<0;11;4m'),
+        wheelUp: await waitFor(() => gridHas('^[[<64;6;4M'), 5_000),
+        wheelDown: await waitFor(() => gridHas('^[[<65;6;4M'), 5_000),
+        // First grid rows for diagnosis when an expectation fails.
+        grid: (() => { try { return addon.getText(term.session).slice(0, 8); } catch { return []; } })()
+      };
+
+      const resultsDir = path.join(__dirname, '..', 'results');
+      fs.mkdirSync(resultsDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(resultsDir, 'demo-mouse-smoke.json'),
+        JSON.stringify(results, null, 2)
+      );
+      try {
+        const img = await ghosttyWin.webContents.capturePage();
+        fs.writeFileSync(path.join(resultsDir, 'demo-mouse-smoke.png'), img.toPNG());
+      } catch {}
+
+      const ok = Object.values(results).every(Boolean);
+      console.log(JSON.stringify(results));
+      app.exit(ok ? 0 : 1);
+    })();
   }
 
   /* ─── smoke mode for integration tests ─────────────────────────────── */

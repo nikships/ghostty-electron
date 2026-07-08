@@ -142,8 +142,24 @@ static bool on_device_attributes(GhosttyTerminal terminal, void *userdata,
   return true;
 }
 
+/** Feed current surface geometry to the mouse encoder (pixel→cell mapping).
+ *  Padding is zero: the surface is exactly cols×rows cells. */
+static void gxb_mouse_encoder_set_size(Session *s) {
+  GhosttyMouseEncoderSize size = {
+      .size = sizeof(GhosttyMouseEncoderSize),
+      .screen_width = (uint32_t)s->px_w,
+      .screen_height = (uint32_t)s->px_h,
+      .cell_width = (uint32_t)s->cell_w,
+      .cell_height = (uint32_t)s->cell_h,
+  };
+  ghostty_mouse_encoder_setopt(s->mouse_encoder,
+                               GHOSTTY_MOUSE_ENCODER_OPT_SIZE, &size);
+}
+
 static void session_free(Session *s) {
   if (!s) return;
+  if (s->mouse_event) ghostty_mouse_event_free(s->mouse_event);
+  if (s->mouse_encoder) ghostty_mouse_encoder_free(s->mouse_encoder);
   if (s->key_event) ghostty_key_event_free(s->key_event);
   if (s->key_encoder) ghostty_key_encoder_free(s->key_encoder);
   if (s->cells) ghostty_render_state_row_cells_free(s->cells);
@@ -208,13 +224,23 @@ static napi_value Create(napi_env env, napi_callback_info info) {
           GHOSTTY_SUCCESS ||
       ghostty_render_state_row_cells_new(NULL, &s->cells) != GHOSTTY_SUCCESS ||
       ghostty_key_encoder_new(NULL, &s->key_encoder) != GHOSTTY_SUCCESS ||
-      ghostty_key_event_new(NULL, &s->key_event) != GHOSTTY_SUCCESS) {
+      ghostty_key_event_new(NULL, &s->key_event) != GHOSTTY_SUCCESS ||
+      ghostty_mouse_encoder_new(NULL, &s->mouse_encoder) != GHOSTTY_SUCCESS ||
+      ghostty_mouse_event_new(NULL, &s->mouse_event) != GHOSTTY_SUCCESS) {
     session_free(s);
     napi_throw_error(env, NULL, "libghostty-vt initialization failed");
     return NULL;
   }
   ghostty_terminal_resize(s->terminal, s->cols, s->rows,
                           (uint32_t)s->cell_w, (uint32_t)s->cell_h);
+
+  // Dedup motion events by cell so hosts can forward raw mousemove events
+  // without flooding the PTY (one report per cell crossed, like ghostty).
+  bool track_last_cell = true;
+  ghostty_mouse_encoder_setopt(s->mouse_encoder,
+                               GHOSTTY_MOUSE_ENCODER_OPT_TRACK_LAST_CELL,
+                               &track_last_cell);
+  gxb_mouse_encoder_set_size(s);
 
   // Enable query responses (see on_write_pty above).
   ghostty_terminal_set(s->terminal, GHOSTTY_TERMINAL_OPT_USERDATA, s);
@@ -409,6 +435,7 @@ static napi_value Resize(napi_env env, napi_callback_info info) {
   if (!gxb_platform_resize(env, s)) return NULL;
   s->surface_seq[0] = 0;
   s->surface_seq[1] = 0;
+  gxb_mouse_encoder_set_size(s);
 
   free(s->row_modified);
   s->row_modified = calloc(rows, sizeof(uint64_t));
@@ -884,6 +911,185 @@ static napi_value EncodeKey(napi_env env, napi_callback_info info) {
   return buf;
 }
 
+/* ── encodeMouse ──────────────────────────────────────────────────────── */
+
+/**
+ * encodeMouse(session, { action, button?, x, y, shift?, ctrl?, alt? })
+ *   → Buffer (empty when the app hasn't enabled mouse tracking, or when
+ *     the event isn't reportable under the current mode)
+ *
+ * action: 'press' | 'release' | 'motion'; button: 0..11 (ghostty numbering:
+ * 1=left 2=right 3=middle 4/5=wheel), omit/-1 for buttonless motion.
+ * x/y are surface-space pixels (same space as the rendered IOSurface).
+ *
+ * Mode-aware like encodeKey: tracking mode and output format are refreshed
+ * from the terminal each call, so DECSET 1000/1002/1003/1005/1006/1015
+ * transitions are respected without host bookkeeping. The encoder also
+ * dedups motion by cell, so hosts can forward raw mousemove events.
+ */
+static napi_value EncodeMouse(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  THROW_IF(env, argc < 2, "encodeMouse(session, event)");
+
+  Session *s = gxb_get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  char action[16] = "press";
+  int32_t button = -1;
+  double x = 0, y = 0;
+  bool shift = false, ctrl = false, alt = false;
+
+  napi_value v;
+  bool has;
+  NAPI_CALL(env, napi_has_named_property(env, argv[1], "action", &has));
+  if (has) {
+    NAPI_CALL(env, napi_get_named_property(env, argv[1], "action", &v));
+    napi_get_value_string_utf8(env, v, action, sizeof(action), NULL);
+  }
+  NAPI_CALL(env, napi_has_named_property(env, argv[1], "button", &has));
+  if (has) {
+    NAPI_CALL(env, napi_get_named_property(env, argv[1], "button", &v));
+    napi_get_value_int32(env, v, &button);
+  }
+#define GET_NUM(name, out)                                               \
+  do {                                                                   \
+    NAPI_CALL(env, napi_has_named_property(env, argv[1], name, &has));   \
+    if (has) {                                                           \
+      NAPI_CALL(env, napi_get_named_property(env, argv[1], name, &v));   \
+      napi_get_value_double(env, v, &(out));                             \
+    }                                                                    \
+  } while (0)
+  GET_NUM("x", x);
+  GET_NUM("y", y);
+#undef GET_NUM
+#define GET_BOOL(name, out)                                              \
+  do {                                                                   \
+    NAPI_CALL(env, napi_has_named_property(env, argv[1], name, &has));   \
+    if (has) {                                                           \
+      NAPI_CALL(env, napi_get_named_property(env, argv[1], name, &v));   \
+      napi_get_value_bool(env, v, &(out));                               \
+    }                                                                    \
+  } while (0)
+  GET_BOOL("shift", shift);
+  GET_BOOL("ctrl", ctrl);
+  GET_BOOL("alt", alt);
+#undef GET_BOOL
+
+  // Refresh tracking mode + output format from current terminal modes.
+  // Deliberately NOT ghostty_mouse_encoder_setopt_from_terminal(): that
+  // resets motion-dedup state on every call, so forwarded mousemove events
+  // would never dedup. Individual setopts only reset dedup when the value
+  // actually changed. (Geometry is set at create/resize for the same
+  // reason.) At most one event mode / format mode is set at a time.
+  GhosttyMouseTrackingMode tracking = GHOSTTY_MOUSE_TRACKING_NONE;
+  bool on = false;
+  if (ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_ANY_MOUSE, &on) ==
+          GHOSTTY_SUCCESS && on)
+    tracking = GHOSTTY_MOUSE_TRACKING_ANY;
+  else if (ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_BUTTON_MOUSE,
+                                     &on) == GHOSTTY_SUCCESS && on)
+    tracking = GHOSTTY_MOUSE_TRACKING_BUTTON;
+  else if (ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_NORMAL_MOUSE,
+                                     &on) == GHOSTTY_SUCCESS && on)
+    tracking = GHOSTTY_MOUSE_TRACKING_NORMAL;
+  else if (ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_X10_MOUSE,
+                                     &on) == GHOSTTY_SUCCESS && on)
+    tracking = GHOSTTY_MOUSE_TRACKING_X10;
+  ghostty_mouse_encoder_setopt(s->mouse_encoder,
+                               GHOSTTY_MOUSE_ENCODER_OPT_EVENT, &tracking);
+
+  GhosttyMouseFormat format = GHOSTTY_MOUSE_FORMAT_X10;
+  if (ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_SGR_PIXELS_MOUSE,
+                                &on) == GHOSTTY_SUCCESS && on)
+    format = GHOSTTY_MOUSE_FORMAT_SGR_PIXELS;
+  else if (ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_SGR_MOUSE,
+                                     &on) == GHOSTTY_SUCCESS && on)
+    format = GHOSTTY_MOUSE_FORMAT_SGR;
+  else if (ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_URXVT_MOUSE,
+                                     &on) == GHOSTTY_SUCCESS && on)
+    format = GHOSTTY_MOUSE_FORMAT_URXVT;
+  else if (ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_UTF8_MOUSE,
+                                     &on) == GHOSTTY_SUCCESS && on)
+    format = GHOSTTY_MOUSE_FORMAT_UTF8;
+  ghostty_mouse_encoder_setopt(s->mouse_encoder,
+                               GHOSTTY_MOUSE_ENCODER_OPT_FORMAT, &format);
+
+  GhosttyMouseAction act = GHOSTTY_MOUSE_ACTION_PRESS;
+  if (strcmp(action, "release") == 0) act = GHOSTTY_MOUSE_ACTION_RELEASE;
+  else if (strcmp(action, "motion") == 0) act = GHOSTTY_MOUSE_ACTION_MOTION;
+
+  GhosttyMods mods = 0;
+  if (shift) mods |= GHOSTTY_MODS_SHIFT;
+  if (ctrl) mods |= GHOSTTY_MODS_CTRL;
+  if (alt) mods |= GHOSTTY_MODS_ALT;
+
+  ghostty_mouse_event_set_action(s->mouse_event, act);
+  if (button >= 0 && button <= GHOSTTY_MOUSE_BUTTON_ELEVEN)
+    ghostty_mouse_event_set_button(s->mouse_event, (GhosttyMouseButton)button);
+  else
+    ghostty_mouse_event_clear_button(s->mouse_event);
+  ghostty_mouse_event_set_mods(s->mouse_event, mods);
+  ghostty_mouse_event_set_position(
+      s->mouse_event, (GhosttyMousePosition){.x = (float)x, .y = (float)y});
+
+  // Drag state for motion-outside-viewport reporting (button modes).
+  bool pressed = act == GHOSTTY_MOUSE_ACTION_PRESS ||
+                 (act == GHOSTTY_MOUSE_ACTION_MOTION && button >= 0);
+  ghostty_mouse_encoder_setopt(
+      s->mouse_encoder, GHOSTTY_MOUSE_ENCODER_OPT_ANY_BUTTON_PRESSED,
+      &pressed);
+
+  char out[128];
+  size_t written = 0;
+  if (ghostty_mouse_encoder_encode(s->mouse_encoder, s->mouse_event, out,
+                                   sizeof(out), &written) != GHOSTTY_SUCCESS)
+    written = 0;
+
+  napi_value buf;
+  void *data;
+  NAPI_CALL(env, napi_create_buffer_copy(env, written, out, &data, &buf));
+  return buf;
+}
+
+/** getMouseState(session) → { tracking, altScreen, altScroll }
+ *  Everything a host needs to arbitrate pointer input:
+ *  - tracking: app enabled a mouse tracking mode → forward via encodeMouse
+ *    (and suppress local selection).
+ *  - altScreen + altScroll (mode 1007, default on): no tracking, but wheel
+ *    should be translated to arrow keys (how less/vim scroll without mouse
+ *    support enabled).
+ *  - neither: local behavior (selection, scrollback wheel). */
+static napi_value GetMouseState(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  Session *s = gxb_get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  bool tracking = false, alt_scroll = false;
+  GhosttyTerminalScreen screen = GHOSTTY_TERMINAL_SCREEN_PRIMARY;
+  ghostty_terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_MOUSE_TRACKING,
+                       &tracking);
+  ghostty_terminal_get(s->terminal, GHOSTTY_TERMINAL_DATA_ACTIVE_SCREEN,
+                       &screen);
+  ghostty_terminal_mode_get(s->terminal, GHOSTTY_MODE_ALT_SCROLL,
+                            &alt_scroll);
+
+  napi_value result, v;
+  NAPI_CALL(env, napi_create_object(env, &result));
+  NAPI_CALL(env, napi_get_boolean(env, tracking, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "tracking", v));
+  NAPI_CALL(env, napi_get_boolean(
+                     env, screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "altScreen", v));
+  NAPI_CALL(env, napi_get_boolean(env, alt_scroll, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "altScroll", v));
+  return result;
+}
+
 /* ── Module init ──────────────────────────────────────────────────────── */
 
 NAPI_MODULE_INIT() {
@@ -895,6 +1101,8 @@ NAPI_MODULE_INIT() {
       {"resize", NULL, Resize, NULL, NULL, NULL, napi_default, NULL},
       {"scroll", NULL, Scroll, NULL, NULL, NULL, napi_default, NULL},
       {"encodeKey", NULL, EncodeKey, NULL, NULL, NULL, napi_default, NULL},
+      {"encodeMouse", NULL, EncodeMouse, NULL, NULL, NULL, napi_default, NULL},
+      {"getMouseState", NULL, GetMouseState, NULL, NULL, NULL, napi_default, NULL},
       {"setSelection", NULL, SetSelection, NULL, NULL, NULL, napi_default, NULL},
       {"clearSelection", NULL, ClearSelection, NULL, NULL, NULL, napi_default, NULL},
       {"getSelectionText", NULL, GetSelectionText, NULL, NULL, NULL, napi_default, NULL},

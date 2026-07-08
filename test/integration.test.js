@@ -107,3 +107,17 @@ test('demo --smoke: zsh echo round-trips through both terminals', MAC, () => {
   assert.strictEqual(r.xtermEcho, true, 'PTY output visible in xterm buffer');
   assert.ok(fs.statSync(path.join(ROOT, 'results', 'demo-ghostty.png')).size > 10_000);
 });
+
+test('demo --mouse-smoke: clicks, drag and wheel reach a mouse-tracking PTY app', MAC, () => {
+  // Real input path: synthesized OS-level events into the renderer →
+  // preload → IPC → libghostty mouse encoder → PTY → raw-mode cat -v
+  // prints the received SGR sequences → visible in the grid.
+  runElectron(['demo/main.js', '--mouse-smoke'], 90_000);
+  const r = readResult('demo-mouse-smoke.json');
+  assert.strictEqual(r.trackingEnabled, true, 'app enabled DECSET 1002/1006');
+  assert.strictEqual(r.press, true, 'left press reported at the clicked cell');
+  assert.strictEqual(r.drag, true, 'drag motion reported with +32 flag at the target cell');
+  assert.strictEqual(r.release, true, 'release reported (SGR lowercase m)');
+  assert.strictEqual(r.wheelUp, true, 'wheel up reported as button 64');
+  assert.strictEqual(r.wheelDown, true, 'wheel down reported as button 65');
+});

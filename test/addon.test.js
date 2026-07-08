@@ -328,6 +328,101 @@ test('key encoding: printables and control keys', () => {
   assert.strictEqual(enc({ code: 'Tab' }), '\t');
 });
 
+test('mouse encoding: nothing reported until the app enables tracking', () => {
+  const t = makeTerm();
+  const cw = Math.round(t.cellWidth), ch = Math.round(t.cellHeight);
+  const press = addon.encodeMouse(t.session, { action: 'press', button: 1, x: cw * 2, y: ch * 3 });
+  assert.strictEqual(press.length, 0, 'no tracking → empty buffer');
+  assert.strictEqual(addon.getMouseState(t.session).tracking, false);
+});
+
+test('mouse encoding: SGR press/release with pixel→cell mapping', () => {
+  const t = makeTerm();
+  write(t, '\x1b[?1000h\x1b[?1006h'); // normal tracking + SGR format (htop, vim)
+  assert.strictEqual(addon.getMouseState(t.session).tracking, true);
+
+  const cw = Math.round(t.cellWidth), ch = Math.round(t.cellHeight);
+  const enc = (ev) => addon.encodeMouse(t.session, ev).toString('latin1');
+
+  // Pixel in the middle of cell (5, 3) → 1-based SGR coords (6, 4).
+  const mid = { x: 5 * cw + cw / 2, y: 3 * ch + ch / 2 };
+  assert.strictEqual(enc({ action: 'press', button: 1, ...mid }), '\x1b[<0;6;4M', 'left press');
+  assert.strictEqual(enc({ action: 'release', button: 1, ...mid }), '\x1b[<0;6;4m', 'left release');
+  assert.strictEqual(enc({ action: 'press', button: 2, ...mid }), '\x1b[<2;6;4M', 'right press');
+  assert.strictEqual(enc({ action: 'press', button: 3, ...mid }), '\x1b[<1;6;4M', 'middle press');
+
+  // Modifiers are encoded into the button code (shift +4, alt +8, ctrl +16).
+  assert.strictEqual(enc({ action: 'press', button: 1, ctrl: true, ...mid }), '\x1b[<16;6;4M');
+
+  // Motion is NOT reported in normal (1000) mode.
+  assert.strictEqual(enc({ action: 'motion', button: 1, ...mid }), '', 'no motion in 1000');
+
+  write(t, '\x1b[?1000l\x1b[?1006l');
+  assert.strictEqual(enc({ action: 'press', button: 1, ...mid }), '', 'off again → empty');
+  assert.strictEqual(addon.getMouseState(t.session).tracking, false);
+});
+
+test('mouse encoding: wheel maps to buttons 4/5 (codes 64/65)', () => {
+  const t = makeTerm();
+  write(t, '\x1b[?1000h\x1b[?1006h');
+  const enc = (ev) => addon.encodeMouse(t.session, ev).toString('latin1');
+  assert.strictEqual(enc({ action: 'press', button: 4, x: 0, y: 0 }), '\x1b[<64;1;1M', 'wheel up');
+  assert.strictEqual(enc({ action: 'press', button: 5, x: 0, y: 0 }), '\x1b[<65;1;1M', 'wheel down');
+});
+
+test('mouse encoding: button-event tracking (1002) reports drags, deduped by cell', () => {
+  const t = makeTerm();
+  write(t, '\x1b[?1002h\x1b[?1006h'); // what vim's mouse=a uses
+  const cw = Math.round(t.cellWidth), ch = Math.round(t.cellHeight);
+  const enc = (ev) => addon.encodeMouse(t.session, ev).toString('latin1');
+
+  assert.strictEqual(enc({ action: 'press', button: 1, x: 2 * cw, y: 2 * ch }), '\x1b[<0;3;3M');
+  // Drag into the next cell: motion flag is +32.
+  assert.strictEqual(enc({ action: 'motion', button: 1, x: 4 * cw, y: 2 * ch }), '\x1b[<32;5;3M');
+  // Another motion within the same cell is deduped.
+  assert.strictEqual(enc({ action: 'motion', button: 1, x: 4 * cw + 2, y: 2 * ch }), '');
+  // Buttonless motion (hover) is not reported in 1002.
+  assert.strictEqual(enc({ action: 'motion', button: -1, x: 6 * cw, y: 2 * ch }), '');
+  assert.strictEqual(enc({ action: 'release', button: 1, x: 4 * cw, y: 2 * ch }), '\x1b[<0;5;3m');
+});
+
+test('mouse encoding: any-event tracking (1003) reports hover motion', () => {
+  const t = makeTerm();
+  write(t, '\x1b[?1003h\x1b[?1006h');
+  const cw = Math.round(t.cellWidth), ch = Math.round(t.cellHeight);
+  const enc = (ev) => addon.encodeMouse(t.session, ev).toString('latin1');
+  // Buttonless motion encodes button code 3 (+32 motion flag = 35).
+  assert.strictEqual(enc({ action: 'motion', button: -1, x: 2 * cw, y: 1 * ch }), '\x1b[<35;3;2M');
+});
+
+test('mouse encoding: legacy X10 format without SGR', () => {
+  const t = makeTerm();
+  write(t, '\x1b[?1000h'); // tracking without 1006 → legacy \x1b[M encoding
+  const cw = Math.round(t.cellWidth), ch = Math.round(t.cellHeight);
+  const press = addon.encodeMouse(t.session, { action: 'press', button: 1, x: 2 * cw, y: 2 * ch });
+  // \x1b[M Cb Cx Cy with 32-offset bytes: button 0+32=' ', col 3+32='#', row 3+32='#'.
+  assert.strictEqual(press.toString('latin1'), '\x1b[M \x23\x23');
+});
+
+test('getMouseState: alt screen and alternate scroll for wheel arbitration', () => {
+  const t = makeTerm();
+  let s = addon.getMouseState(t.session);
+  assert.deepStrictEqual(s, { tracking: false, altScreen: false, altScroll: true },
+    '1007 defaults on; primary screen');
+
+  write(t, '\x1b[?1049h'); // enter alt screen (less/vim without mouse)
+  s = addon.getMouseState(t.session);
+  assert.strictEqual(s.altScreen, true, 'alt screen active');
+  assert.strictEqual(s.tracking, false, 'still no tracking');
+
+  write(t, '\x1b[?1007l');
+  assert.strictEqual(addon.getMouseState(t.session).altScroll, false, '1007 can be disabled');
+
+  write(t, '\x1b[?1049l\x1b[?1007h');
+  s = addon.getMouseState(t.session);
+  assert.strictEqual(s.altScreen, false, 'back to primary');
+});
+
 test('key encoding is mode-aware (DECCKM application cursor keys)', () => {
   const t = makeTerm();
   const enc = (ev) => addon.encodeKey(t.session, ev).toString('latin1');

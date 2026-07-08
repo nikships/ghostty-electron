@@ -50,6 +50,8 @@ typedef struct {
   GhosttyRenderStateRowCells cells;
   GhosttyKeyEncoder key_encoder;
   GhosttyKeyEvent key_event;
+  GhosttyMouseEncoder mouse_encoder;
+  GhosttyMouseEvent mouse_event;
 
   uint16_t cols, rows;
   double scale;

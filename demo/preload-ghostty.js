@@ -30,16 +30,16 @@ sharedTexture.setSharedTextureReceiver(async (data, meta) => {
   }
 });
 
-let cellW = 8, cellH = 16;
-
-ipcRenderer.on('init', (event, { cssWidth, cssHeight, cellWidth, cellHeight }) => {
+ipcRenderer.on('init', (event, { cssWidth, cssHeight }) => {
   const canvas = document.getElementById('terminal-canvas');
   canvas.style.width = cssWidth + 'px';
   canvas.style.height = cssHeight + 'px';
   canvas.style.cursor = 'text';
-  cellW = cellWidth;
-  cellH = cellHeight;
   canvas.focus();
+  // Where the canvas landed (CSS px, window-relative): lets the main
+  // process aim synthesized input events in the mouse-smoke test.
+  const r = canvas.getBoundingClientRect();
+  ipcRenderer.send('canvas-rect', { left: r.left, top: r.top });
 });
 
 ipcRenderer.on('stats', (event, s) => {
@@ -136,39 +136,36 @@ window.addEventListener('DOMContentLoaded', () => {
     });
   });
 
-  window.addEventListener('wheel', (e) => {
-    ipcRenderer.send('g-wheel', { deltaY: e.deltaY });
-  }, { passive: true });
-
-  // Mouse selection: report cell coordinates; main drives the ghostty
-  // selection API and re-renders with the range inverted.
+  // Mouse: forward raw events with canvas-relative CSS pixel coords; main
+  // arbitrates between app mouse tracking (encoded via libghostty and sent
+  // to the PTY) and local behavior (selection, link clicks, scrollback).
   const canvas = document.getElementById('terminal-canvas');
-  let dragging = false;
-  const cellOf = (e) => {
+  const mouseMsg = (type, e, extra) => {
     const rect = canvas.getBoundingClientRect();
     return {
-      x: Math.floor((e.clientX - rect.left) / cellW),
-      y: Math.floor((e.clientY - rect.top) / cellH)
+      type,
+      cssX: e.clientX - rect.left,
+      cssY: e.clientY - rect.top,
+      shift: e.shiftKey,
+      ctrl: e.ctrlKey,
+      alt: e.altKey,
+      meta: e.metaKey,
+      ...extra
     };
   };
+  window.addEventListener('wheel', (e) => {
+    ipcRenderer.send('g-wheel', mouseMsg('wheel', e, { deltaY: e.deltaY }));
+  }, { passive: true });
   canvas.addEventListener('mousedown', (e) => {
-    if (e.button !== 0) return;
-    if (e.metaKey) {
-      ipcRenderer.send('g-link', cellOf(e)); // Cmd+click opens URLs
-      return;
-    }
-    dragging = true;
-    ipcRenderer.send('g-sel', { phase: 'start', ...cellOf(e) });
+    ipcRenderer.send('g-mouse', mouseMsg('down', e, { button: e.button }));
   });
   canvas.addEventListener('dblclick', (e) => {
-    ipcRenderer.send('g-selword', cellOf(e));
+    ipcRenderer.send('g-mouse', mouseMsg('dblclick', e, { button: e.button }));
   });
   window.addEventListener('mousemove', (e) => {
-    if (dragging) ipcRenderer.send('g-sel', { phase: 'drag', ...cellOf(e) });
+    ipcRenderer.send('g-mouse', mouseMsg('move', e, { buttons: e.buttons }));
   });
   window.addEventListener('mouseup', (e) => {
-    if (!dragging) return;
-    dragging = false;
-    ipcRenderer.send('g-sel', { phase: 'end', ...cellOf(e) });
+    ipcRenderer.send('g-mouse', mouseMsg('up', e, { button: e.button }));
   });
 });

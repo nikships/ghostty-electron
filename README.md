@@ -158,8 +158,13 @@ Metal/GPU pass isn't needed at current targets.
 Two windows, each a real interactive shell: left xterm.js, right ghostty —
 with mouse selection, double-click word selection, Cmd+C/Cmd+V, Cmd+F
 search over scrollback, Cmd+click to open URLs, IME composition, cursor
-blink, wheel scrollback, and mode-aware arrow keys for vim/less. Run
-`time cat payload.txt`, `find /`, or hold a key in vim, side by side.
+blink, wheel scrollback, and mode-aware arrow keys for vim/less. Mouse
+reporting goes through libghostty's mouse encoder: click a process in
+htop, drag-select in vim with `:set mouse=a`, wheel-scroll htop's list —
+wheel falls back to arrow keys for `less` (alternate scroll) and to our
+scrollback otherwise, and shift+drag bypasses the app for local selection,
+like every native terminal. Run `time cat payload.txt`, `find /`, or hold
+a key in vim, side by side.
 
 ## Platform matrix
 
@@ -217,7 +222,10 @@ Four test layers (`npm test` + `npm run test:integration`, all in CI):
    (`readPixels`): SGR colors land in the right cells, cursor drawn, box
    drawing renders as aligned geometry; dirty tracking across double
    buffering; scrollback; resize; selection; **mode-aware key encoding**
-   (ArrowUp flips `\e[A`→`\eOA` under DECCKM, like vim expects).
+   (ArrowUp flips `\e[A`→`\eOA` under DECCKM, like vim expects);
+   **mode-aware mouse encoding** (nothing until the app enables tracking,
+   SGR/legacy formats, pixel→cell mapping, wheel buttons, drag motion
+   deduped by cell, hover motion only in any-event mode).
 2. **Render-equivalence invariant** — after any incremental update sequence,
    the frame must be pixel-identical to a from-scratch full redraw. This is
    the regression net for the entire "corrupted TUI" bug class (glyph bleed,
@@ -231,8 +239,11 @@ Four test layers (`npm test` + `npm run test:integration`, all in CI):
    written up with minimal repros in `docs/upstream-divergences.md`.
 4. **Electron integration** — the real apps run end-to-end on CI: both
    benchmarks produce sane per-stage stats and screenshots, the PTY race
-   completes at 8 MiB with valid metrics, and the demo round-trips a live
-   zsh echo through both keyboard→PTY→parser→render pipelines.
+   completes at 8 MiB with valid metrics, the demo round-trips a live
+   zsh echo through both keyboard→PTY→parser→render pipelines, and the
+   mouse smoke test synthesizes OS-level clicks/drag/wheel into the real
+   renderer and verifies a mouse-tracking PTY app receives the exact SGR
+   sequences at the clicked cells.
 
 CI runs the full suite on macOS (Apple Silicon runner, including the
 Electron GUI apps and benchmarks — numbers in each run's job summary) and
