@@ -69,6 +69,10 @@ function presentTick() {
 
 const handlers = {
   create({ opts }) {
+    // One session per host process — module state (session, ack flow,
+    // frame dedup) is a singleton. A second create would leak the
+    // running shell; refuse loudly until multi-session lands.
+    if (session) throw new Error('host already has a session (one per process)');
     session = addon.create(opts);
     presentTimer = setInterval(presentTick, PRESENT_INTERVAL_MS);
     post({ type: 'created' });
@@ -117,11 +121,11 @@ function teardown() {
 process.parentPort.on('message', (e) => {
   const msg = e.data;
   const handler = handlers[msg?.type];
-  if (!handler) return;
   try {
+    if (!handler) throw new Error(`unknown message type '${msg?.type}'`);
     handler(msg);
   } catch (err) {
-    post({ type: 'error', message: `${msg.type}: ${err.message}` });
+    post({ type: 'error', message: `${msg?.type}: ${err.message}` });
   }
 });
 

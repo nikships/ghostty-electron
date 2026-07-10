@@ -239,6 +239,10 @@ class UtilityEngine {
         break;
       case 'draw': this._child.postMessage({ type: 'draw' }); break;
       case 'tick': break; // the host ticks itself
+      default:
+        // Loud failure: a typo'd method silently no-oping is how the
+        // two engine drivers drift apart.
+        throw new Error(`UtilityEngine: unknown method '${method}'`);
     }
   }
 

@@ -82,12 +82,6 @@ function printTable(title, rows) {
       `parse: ${(baseline.result.parseMs / result.parseMs).toFixed(1)}×   ` +
       `e2e: ${(baseline.result.e2eMs / result.e2eMs).toFixed(1)}×`);
   }
-  const g = rows.find((r) => r.backend.key === 'ghostty');
-  if (g) {
-    const r = g.result;
-    console.log(`  ghostty per-stage: write ${r.writeMs.toFixed(1)}ms · render ${r.renderMs.toFixed(1)}ms · ` +
-                `send ${r.sendMs.toFixed(1)}ms · present p50 ${r.presentP50Ms.toFixed(1)}ms / p95 ${r.presentP95Ms.toFixed(1)}ms`);
-  }
   for (const { backend, result } of rows)
     console.log(`  e2e runs — ${backend.key}: [${result.allE2eMs.join(', ')}]`);
 }

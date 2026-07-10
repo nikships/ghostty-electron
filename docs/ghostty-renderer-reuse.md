@@ -262,6 +262,13 @@ renderer is the bottleneck — the JS-thread parse loop is.
 
 ## Recommendation
 
+> **Historical note:** this section's letters predate the final naming.
+> What the paragraph below calls "B" (ghostty's renderer + ghostty's
+> PTY, everything owned by ghostty) is what shipped and is labeled
+> **approach A** everywhere else in the repo today. The `~17 ms` /
+> `4–12×` numbers were measured with the pre-rewrite benchmark harness
+> (last at commit `1a4357c`) and are not reproducible from HEAD.
+
 **B is the one to integrate**, and it's now integrated end-to-end:
 `demo-ghostty-renderer/` runs ghostty's renderer AND ghostty's PTY
 (node-pty fully removed — output bytes never touch the JS thread;
@@ -287,8 +294,12 @@ with an explicit release, which is exactly the shape
 
 ## Reproduce
 
+> **Historical note:** only the headless PoC survives in the tree
+> (`native/renderer-poc/headless_a.c`, plus the Linux EGL probes); the
+> B and C PoCs were removed with the decision (last at commit
+> `1a4357c`). `make test` runs what remains.
+
 ```bash
-npm run setup:ghostty                    # clone + build vendor/ghostty
-bash scripts/apply-ghostty-patches.sh    # fork patch + full libghostty.a
-cd native/renderer-poc && make test      # runs all three PoCs
+npm run setup:ghostty                    # clone + build vendor/ghostty (applies patches)
+cd native/renderer-poc && make test     # headless PoC, pixel-asserting
 ```

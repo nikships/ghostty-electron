@@ -25,9 +25,18 @@ the pixels never leave the GPU. Set `engine: 'main'` to run the engine
 in-process (the original mode; tests use it for synchronous pixel
 assertions).
 
-macOS-only for now (Metal + IOSurface); Linux needs an EGL/GBM
-presenter, Windows a D3D11 one — see `docs/ghostty-renderer-reuse.md`
-at the repo root.
+macOS-only for now (Metal + IOSurface). Linux needs an EGL/GBM
+presenter (probe experiments in `native/renderer-poc/`); Windows has
+no presentation path in this architecture — the earlier CPU-rasterizer
+iteration had a working D3D11/DirectWrite producer, last at repo
+commit `1a4357c`. See `docs/ghostty-renderer-reuse.md` at the repo
+root.
+
+⚠️ **Security caveat:** frames cross the engine→main process boundary
+as *global* IOSurfaces (`kIOSurfaceIsGlobal`, patch `0002`), meaning
+any local process that guesses a surface ID can read the terminal's
+pixels. Acceptable for research, not for shipping; the production path
+is an `IOSurfaceCreateMachPort` handoff.
 
 ## Usage
 
