@@ -34,7 +34,7 @@ if (!fs.existsSync(APP)) {
   process.exit(1);
 }
 
-// Reuse pty-bench's payload naming so files are shared between benchmarks.
+// Payload files are cached per size (payload-<mb>mb.txt).
 const payload = path.join(__dirname, '..', `payload-${SIZE_MB}mb.txt`);
 if (!fs.existsSync(payload)) {
   console.log(`generating ${SIZE_MB} MiB payload...`);
@@ -110,7 +110,7 @@ const deadline = Date.now() + 15 * 60 * 1000;
     const resultsDir = path.join(__dirname, '..', 'results');
     fs.mkdirSync(resultsDir, { recursive: true });
     fs.writeFileSync(path.join(resultsDir, 'stock-ghostty.json'), JSON.stringify(out, null, 2));
-    console.log('\nCompare with catExitMs in results/pty-bench.json (same --mb, same finish line).');
+    console.log();
     fs.unlinkSync(resultFile);
     return;
   }

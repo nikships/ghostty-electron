@@ -6,17 +6,13 @@ on:
   pull_request:
   workflow_dispatch:
 
-# gh run list/download in the "Compare with previous main run" step query the
-# Actions API, which needs actions:read. Without an explicit block the token
-# inherits a restricted default and returns "HTTP 403: Resource not accessible
-# by integration". contents:read covers actions/checkout.
 permissions:
   contents: read
   actions: read
 
 jobs:
   macos:
-    name: macOS (full suite + benchmarks)
+    name: macOS (headless ghostty embedding, e2e + integration)
     runs-on: macos-15
     timeout-minutes: 60
     steps:
@@ -33,55 +29,30 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build libghostty-vt
+      - name: Build patched libghostty (clone + fork patch + full lib)
         run: npm run setup:ghostty
 
-      - name: Build native addon
+      - name: Build N-API addon (ghostty embedding wrapper)
         run: npm run build:native
 
       - name: Generate payload
         run: npm run payload
 
-      - name: Unit + conformance + fuzz tests
+      - name: Headless embedding PoC (pixel-asserting, no Electron)
+        run: make -C native/renderer-poc test
+
+      - name: E2E tests (spawn/input/resize/scroll, IOSurface pixels)
         run: npm test
 
-      - name: Parse benchmark (10 MiB)
-        run: npm run bench:parse -- --mb 10 --runs 3
-
-      - name: Integration tests (Electron apps, PTY race, demo smoke)
+      - name: "Integration tests (Electron: DOM benches + demo smoke)"
         run: npm run test:integration
 
-      - name: In-terminal benchmark (burst + sustained)
+      - name: DOM terminal flood benchmarks
         run: node bench/run.js flood --runs 3
-
-      - name: PTY race benchmark (64 MiB)
-        run: npx electron bench/pty-main.js --mb 64 --interrupt-ms 2000
-
-      - name: Input-latency probe
-        run: npx electron bench/pty-main.js --latency --mb 8 --samples 4
-
-      - name: Soak (2 min per terminal; trend measured after warm-up)
-        run: npx electron bench/pty-main.js --soak-min 2 --mb 16
-
-      - name: Render-stress benchmark
-        run: npm run bench:render
-
-      - name: Compare with previous main run
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          artifact="results-$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
-          prev=$(gh run list --workflow ci.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
-          if [ -n "$prev" ]; then
-            gh run download "$prev" -n "$artifact" -D previous-results || true
-          fi
-          node scripts/compare-results.js previous-results >> "$GITHUB_STEP_SUMMARY"
 
       - name: Job summary
         if: always()
+        shell: bash
         run: node scripts/ci-summary.js >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
@@ -92,7 +63,7 @@ jobs:
           if-no-files-found: ignore
 
   linux:
-    name: Linux (parser + xterm baseline)
+    name: Linux (fork compiles + DOM baselines; headless rendering pending EGL/GBM)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -109,20 +80,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build libghostty-vt
+      - name: Build patched libghostty (proves the fork compiles on Linux)
         run: npm run setup:ghostty
 
-      - name: Build native addon (VT core + stub platform layer)
-        run: npm run build:native
+      - name: E2E tests (skip on non-Darwin by design)
+        run: npm test
 
       - name: Generate payload
         run: npm run payload
-
-      - name: Unit + conformance + fuzz tests (renderer tests skip)
-        run: npm test
-
-      - name: Parse benchmark (10 MiB)
-        run: npm run bench:parse -- --mb 10 --runs 3
 
       - name: DOM terminal benchmarks (Electron under xvfb)
         # SwiftShader WebGL2 is blocklisted by default on GPU-less machines;
@@ -135,134 +100,14 @@ jobs:
             --enable-unsafe-swiftshader --ignore-gpu-blocklist \
             bench/flood-dom-main.js --backend ghostty-web
 
-      - name: Compare with previous main run
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          artifact="results-$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
-          prev=$(gh run list --workflow ci.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
-          if [ -n "$prev" ]; then
-            gh run download "$prev" -n "$artifact" -D previous-results || true
-          fi
-          node scripts/compare-results.js previous-results >> "$GITHUB_STEP_SUMMARY"
-
       - name: Job summary
         if: always()
+        shell: bash
         run: node scripts/ci-summary.js >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: results-linux
-          path: results/
-          if-no-files-found: ignore
-
-  windows:
-    name: Windows (full addon + benchmarks)
-    # windows-latest now maps to Windows 2025 + VS2026 ("Visual Studio 18"),
-    # which node-gyp ≤11.x cannot identify:
-    # https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-VS2026-Readme.md
-    # windows-2022 carries VS2022 which node-gyp handles fine. Revisit when
-    # node-gyp learns VS2026.
-    runs-on: windows-2022
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build libghostty-vt
-        shell: bash
-        run: |
-          git clone --depth 1 https://github.com/ghostty-org/ghostty vendor/ghostty
-          cd vendor/ghostty
-          # Explicit msvc ABI: zig's default gnu-ABI objects break link.exe's
-          # default-CRT resolution (unresolved malloc/calloc everywhere).
-          zig build -Demit-lib-vt=true -Doptimize=ReleaseFast -Dtarget=x86_64-windows-msvc
-          # zig installs ghostty-vt.lib (DLL import lib) AND
-          # ghostty-vt-static.lib (the static archive we link).
-          ls -la zig-out/lib
-
-      - name: Build native addon (VT core + D3D11/DirectWrite producer)
-        run: npm run build:native
-
-      - name: Inspect addon DLL dependencies (diagnostics)
-        shell: pwsh
-        run: |
-          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
-          $dumpbin = Get-ChildItem "$vsPath\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" | Select-Object -First 1
-          & $dumpbin /DEPENDENTS native/build/Release/ghostty_producer.node
-
-      - name: Generate payload
-        run: npm run payload
-
-      - name: Unit + conformance + fuzz tests (incl. D3D11 renderer)
-        run: npm test
-
-      - name: Parse benchmark (10 MiB)
-        run: npm run bench:parse -- --mb 10 --runs 3
-
-      - name: DOM terminal benchmarks (Electron)
-        run: |
-          npx electron bench/flood-dom-main.js --backend xterm
-          npx electron bench/flood-dom-main.js --backend ghostty-web
-
-      # Experimental until proven on the GPU-less runner: sharedTexture
-      # import of D3D11 NT handles under WARP inside Chromium's GPU process.
-      # NOTE: continue-on-error steps report conclusion=success even when the
-      # outcome failed — read the log, not the checkmark.
-      - name: ghostty benchmark (Electron sharedTexture, experimental)
-        continue-on-error: true
-        env:
-          ELECTRON_ENABLE_LOGGING: "1"
-        run: npx electron bench/flood-native-main.js --screenshot --enable-logging
-
-      # ConPTY itself caps PTY throughput at ~0.1 MB/s on runners (measured
-      # pipe ceiling) — this race exercises correctness there, not speed.
-      # timeout-minutes: at 0.1 MB/s a 2 MiB cat takes ~1 min per backend;
-      # the PowerShell interrupt probe has hung indefinitely before
-      # (continue-on-error masks a failure but not a hang).
-      - name: PTY race smoke (ConPTY + PowerShell, experimental)
-        continue-on-error: true
-        timeout-minutes: 10
-        env:
-          ELECTRON_ENABLE_LOGGING: "1"
-        run: npx electron bench/pty-main.js --mb 2 --interrupt-ms 500
-
-      - name: Compare with previous main run
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          artifact="results-$(echo "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
-          prev=$(gh run list --workflow ci.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId' || true)
-          if [ -n "$prev" ]; then
-            gh run download "$prev" -n "$artifact" -D previous-results || true
-          fi
-          node scripts/compare-results.js previous-results >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Job summary
-        if: always()
-        shell: bash
-        run: node scripts/ci-summary.js >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: results-windows
           path: results/
           if-no-files-found: ignore

@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>ghostty renderer (approach B)</title>
+  <style>
+    body { margin: 0; background: #1d1f21; display: flex; flex-direction: column; align-items: center; }
+    #badge { color: #6c7086; font: 11px -apple-system, sans-serif; padding: 4px; }
+    #terminal-canvas { background: #1d1f21; outline: none; }
+  </style>
+</head>
+<body>
+  <div id="badge">ghostty embedded headlessly (approach A): ghostty owns PTY, parsing, input encoding, fonts, Metal rendering — frames imported zero-copy via sharedTexture</div>
+  <canvas id="terminal-canvas" tabindex="0"></canvas>
+</body>
+</html>

@@ -1,0 +1,348 @@
+From 918d6b0d8e1c7ce0b0d6dbe8e2f5e57ee801d351 Mon Sep 17 00:00:00 2001
+From: Max Schmitt <max@schmitt.mx>
+Date: Thu, 9 Jul 2026 20:49:45 -0700
+Subject: [PATCH] apprt/embedded: headless platform for offscreen embedding
+ (macOS)
+
+GHOSTTY_PLATFORM_HEADLESS: a surface with no NSView. The Metal
+backend's IOSurfaceLayer already works standalone (the view was only
+a place to hang the layer), so headless skips the attach and sizes
+the layer directly via the new Metal.setLayerSize().
+
+ghostty_surface_headless_frame() returns the last presented IOSurface
+(retained +1 for the caller) with size/scale, so embedders can read
+frames or import them into their own compositor (e.g. Electron's
+sharedTexture module) without any view hierarchy.
+
+Also installs libghostty.a on macOS (previously only the xcframework
+path consumed the full library).
+---
+ build.zig              |  8 +++-
+ include/ghostty.h      | 21 ++++++++++
+ src/apprt/embedded.zig | 93 ++++++++++++++++++++++++++++++++++++++++++
+ src/renderer/Metal.zig | 40 ++++++++++++++----
+ 4 files changed, 153 insertions(+), 9 deletions(-)
+
+diff --git a/build.zig b/build.zig
+index 8ef7701..929f5fd 100644
+--- a/build.zig
++++ b/build.zig
+@@ -189,8 +189,6 @@ pub fn build(b: *std.Build) !void {
+         const lib_shared = try buildpkg.GhosttyLib.initShared(b, &deps);
+         const lib_static = try buildpkg.GhosttyLib.initStatic(b, &deps);
+ 
+-        // We shouldn't have this guard but we don't currently
+-        // build on macOS this way ironically so we need to fix that.
+         if (!config.target.result.os.tag.isDarwin()) {
+             lib_shared.installHeader(); // Only need one header
+             if (config.target.result.os.tag == .windows) {
+@@ -200,6 +198,12 @@ pub fn build(b: *std.Build) !void {
+                 lib_shared.install("ghostty-internal.so");
+                 lib_static.install("ghostty-internal.a");
+             }
++        } else {
++            // On macOS install the static archive directly so embedders
++            // that aren't the Ghostty.app Xcode project (which consumes
++            // the xcframework) can link the full library.
++            lib_static.installHeader();
++            lib_static.install("libghostty.a");
+         }
+     }
+ 
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 72bbb57..6d78d3e 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -66,6 +66,7 @@ typedef enum {
+   GHOSTTY_PLATFORM_INVALID,
+   GHOSTTY_PLATFORM_MACOS,
+   GHOSTTY_PLATFORM_IOS,
++  GHOSTTY_PLATFORM_HEADLESS,
+ } ghostty_platform_e;
+ 
+ typedef enum {
+@@ -453,11 +454,29 @@ typedef struct {
+   void* uiview;
+ } ghostty_platform_ios_s;
+ 
++// No native view: the renderer draws into offscreen targets
++// (IOSurfaces on macOS) that the embedder reads back via
++// ghostty_surface_headless_frame().
++typedef struct {
++  void* reserved;
++} ghostty_platform_headless_s;
++
+ typedef union {
+   ghostty_platform_macos_s macos;
+   ghostty_platform_ios_s ios;
++  ghostty_platform_headless_s headless;
+ } ghostty_platform_u;
+ 
++// The last presented frame of a headless surface. The iosurface is an
++// IOSurfaceRef retained on behalf of the caller (CFRelease when done),
++// or NULL if no frame has been presented yet.
++typedef struct {
++  void* iosurface;
++  uint32_t width_px;
++  uint32_t height_px;
++  double scale;
++} ghostty_headless_frame_s;
++
+ typedef enum {
+   GHOSTTY_SURFACE_CONTEXT_WINDOW = 0,
+   GHOSTTY_SURFACE_CONTEXT_TAB = 1,
+@@ -1111,6 +1130,8 @@ GHOSTTY_API bool ghostty_surface_needs_confirm_quit(ghostty_surface_t);
+ GHOSTTY_API bool ghostty_surface_process_exited(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_refresh(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_draw(ghostty_surface_t);
++GHOSTTY_API ghostty_headless_frame_s
++ghostty_surface_headless_frame(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_set_content_scale(ghostty_surface_t, double, double);
+ GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
+ GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 7310159..14a37e2 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -9,6 +9,8 @@ const builtin = @import("builtin");
+ const assert = @import("../quirks.zig").inlineAssert;
+ const Allocator = std.mem.Allocator;
+ const objc = @import("objc");
++const macos_pkg = @import("macos");
++const graphics = macos_pkg.graphics;
+ const apprt = @import("../apprt.zig");
+ const font = @import("../font/main.zig");
+ const input = @import("../input.zig");
+@@ -345,6 +347,7 @@ pub const App = struct {
+ pub const Platform = union(PlatformTag) {
+     macos: MacOS,
+     ios: IOS,
++    headless: Headless,
+ 
+     // If our build target for libghostty is not darwin then we do
+     // not include macos support at all.
+@@ -358,6 +361,14 @@ pub const Platform = union(PlatformTag) {
+         uiview: objc.Object,
+     } else void;
+ 
++    /// Headless: no view at all. The renderer draws into offscreen
++    /// targets (IOSurfaces on macOS) and the embedder reads presented
++    /// frames via ghostty_surface_headless_frame(). This exists so
++    /// embedders that composite frames themselves (e.g. via Electron's
++    /// sharedTexture module) can reuse Ghostty's renderer without
++    /// providing a native view hierarchy.
++    pub const Headless = struct {};
++
+     // The C ABI compatible version of this union. The tag is expected
+     // to be stored elsewhere.
+     pub const C = extern union {
+@@ -368,6 +379,10 @@ pub const Platform = union(PlatformTag) {
+         ios: extern struct {
+             uiview: ?*anyopaque,
+         },
++
++        headless: extern struct {
++            reserved: ?*anyopaque,
++        },
+     };
+ 
+     /// Initialize a Platform a tag and configuration from the C ABI.
+@@ -387,6 +402,8 @@ pub const Platform = union(PlatformTag) {
+                     break :ios error.UIViewMustBeSet);
+                 break :ios .{ .ios = .{ .uiview = uiview } };
+             } else error.UnsupportedPlatform,
++
++            .headless => .{ .headless = .{} },
+         };
+     }
+ };
+@@ -397,6 +414,7 @@ pub const PlatformTag = enum(c_int) {
+ 
+     macos = 1,
+     ios = 2,
++    headless = 3,
+ };
+ 
+ pub const EnvVar = extern struct {
+@@ -586,6 +604,19 @@ pub const Surface = struct {
+         );
+         errdefer self.core_surface.deinit();
+ 
++        // Headless surfaces have no view to lay out the renderer's
++        // layer, so give it our initial size directly. (updateSize
++        // early-returns when the requested size equals the default,
++        // so this can't be deferred to the first set_size call.)
++        if (comptime builtin.target.os.tag.isDarwin()) {
++            if (self.platform == .headless) {
++                self.core_surface.renderer.api.setLayerSize(
++                    self.size.width,
++                    self.size.height,
++                );
++            }
++        }
++
+         // If our options requested a specific font-size, set that.
+         if (opts.font_size != 0) {
+             var font_size = self.core_surface.font_size;
+@@ -805,6 +836,15 @@ pub const Surface = struct {
+             .height = height,
+         };
+ 
++        // Headless surfaces have no view to lay out the renderer's
++        // layer, so we size it directly; the renderer derives its
++        // render target size from the layer bounds.
++        if (comptime builtin.target.os.tag.isDarwin()) {
++            if (self.platform == .headless) {
++                self.core_surface.renderer.api.setLayerSize(width, height);
++            }
++        }
++
+         // Call the primary callback.
+         self.core_surface.sizeCallback(self.size) catch |err| {
+             log.err("error in size callback err={}", .{err});
+@@ -1692,6 +1732,59 @@ pub const CAPI = struct {
+         surface.draw();
+     }
+ 
++    /// The last presented frame of a headless surface.
++    /// C type: ghostty_headless_frame_s
++    const HeadlessFrame = extern struct {
++        /// IOSurfaceRef of the last presented frame, retained (+1);
++        /// the caller must CFRelease it. Null if no frame has been
++        /// presented yet or this isn't a Darwin build.
++        iosurface: ?*anyopaque,
++        width_px: u32,
++        height_px: u32,
++        scale: f64,
++    };
++
++    /// Returns the last presented frame of a headless surface. Only
++    /// meaningful for surfaces created with the headless platform tag,
++    /// but safe to call on any surface (frames are presented to the
++    /// same layer in all cases).
++    ///
++    /// The frame is the renderer's most recently presented render
++    /// target. Ghostty triple-buffers, so the returned IOSurface will
++    /// not be drawn into again until two more frames are presented;
++    /// callers that need the pixels for longer should copy or import
++    /// the surface promptly. Call ghostty_surface_draw() first to force
++    /// a synchronous present of any pending frame.
++    export fn ghostty_surface_headless_frame(surface: *Surface) HeadlessFrame {
++        if (comptime builtin.target.os.tag.isDarwin()) {
++            const layer = surface.core_surface.renderer.api.layer.layer;
++            const contents = layer.getProperty(?*anyopaque, "contents");
++            if (contents) |ptr| {
++                // Retain for the caller. The layer holds its own
++                // reference; ours guarantees validity after the layer
++                // moves on.
++                const CFRetain = @extern(
++                    *const fn (?*anyopaque) callconv(.c) ?*anyopaque,
++                    .{ .name = "CFRetain" },
++                );
++                _ = CFRetain(ptr);
++            }
++            const scale = layer.getProperty(f64, "contentsScale");
++            const bounds = layer.getProperty(graphics.Rect, "bounds");
++            return .{
++                .iosurface = contents,
++                .width_px = @intFromFloat(@round(bounds.size.width * scale)),
++                .height_px = @intFromFloat(@round(bounds.size.height * scale)),
++                .scale = scale,
++            };
++        } else return .{
++            .iosurface = null,
++            .width_px = 0,
++            .height_px = 0,
++            .scale = 1,
++        };
++    }
++
+     /// Update the size of a surface. This will trigger resize notifications
+     /// to the pty and the renderer.
+     export fn ghostty_surface_set_size(surface: *Surface, w: u32, h: u32) void {
+diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
+index 6c7432d..72aff65 100644
+--- a/src/renderer/Metal.zig
++++ b/src/renderer/Metal.zig
+@@ -88,7 +88,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
+     );
+ 
+     const ViewInfo = struct {
+-        view: objc.Object,
++        view: ?objc.Object,
+         scaleFactor: f64,
+     };
+ 
+@@ -99,6 +99,11 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
+             .view = switch (opts.rt_surface.platform) {
+                 .macos => |v| v.nsview,
+                 .ios => |v| v.uiview,
++                // Headless surfaces have no view; the IOSurfaceLayer
++                // still holds the presented frame so embedders can read
++                // it back (or import the IOSurface into their own
++                // compositor).
++                .headless => null,
+             },
+         },
+ 
+@@ -119,23 +124,25 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
+     //
+     // On iOS, views are always layer-backed, and `layer`
+     // is readonly, so instead we add it as a sublayer.
+-    switch (comptime builtin.os.tag) {
++    //
++    // Headless surfaces have no view: the layer stands alone.
++    if (info.view) |view| switch (comptime builtin.os.tag) {
+         .macos => {
+-            info.view.setProperty("layer", layer.layer.value);
+-            info.view.setProperty("wantsLayer", true);
++            view.setProperty("layer", layer.layer.value);
++            view.setProperty("wantsLayer", true);
+         },
+ 
+         .ios => {
+-            const view_layer = objc.Object.fromId(info.view.getProperty(?*anyopaque, "layer"));
++            const view_layer = objc.Object.fromId(view.getProperty(?*anyopaque, "layer"));
+             view_layer.msgSend(void, objc.sel("addSublayer:"), .{layer.layer.value});
+         },
+ 
+         else => @compileError("unsupported target for Metal"),
+-    }
++    };
+ 
+     // Ensure that if our layer is oversized it
+     // does not overflow the bounds of the view.
+-    info.view.setProperty("clipsToBounds", true);
++    if (info.view) |view| view.setProperty("clipsToBounds", true);
+ 
+     // Ensure that our layer has a content scale set to
+     // match the scale factor of the window. This avoids
+@@ -212,6 +219,25 @@ pub fn initShaders(
+     );
+ }
+ 
++/// Set the layer bounds directly. This is used by headless surfaces,
++/// which have no view hierarchy to lay the layer out: the renderer
++/// derives its target size from the layer bounds (see surfaceSize),
++/// so without this a headless surface would render at 0x0.
++///
++/// width/height are in pixels; bounds are points, so we divide by
++/// the layer's contentsScale.
++pub fn setLayerSize(self: *const Metal, width_px: u32, height_px: u32) void {
++    const scale = self.layer.layer.getProperty(f64, "contentsScale");
++    const bounds: graphics.Rect = .{
++        .origin = .{ .x = 0, .y = 0 },
++        .size = .{
++            .width = @as(f64, @floatFromInt(width_px)) / scale,
++            .height = @as(f64, @floatFromInt(height_px)) / scale,
++        },
++    };
++    self.layer.layer.setProperty("bounds", bounds);
++}
++
+ /// Get the current size of the runtime surface.
+ pub fn surfaceSize(self: *const Metal) !struct { width: u32, height: u32 } {
+     const bounds = self.layer.layer.getProperty(graphics.Rect, "bounds");
+-- 
+2.50.1 (Apple Git-155)
+

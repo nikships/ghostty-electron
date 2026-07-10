@@ -24,16 +24,10 @@ const electronize = (entry) => {
 };
 
 switch (suite) {
-  case 'parse':
-    require('./parse')();
-    break;
   case 'flood':
     require('./flood'); // spawns Electron per backend itself
     break;
-  case 'pty':
-    electronize('pty-main.js');
-    break;
   default:
-    console.error('usage: node bench/run.js <parse|flood|pty> [suite flags]');
+    console.error('usage: node bench/run.js <flood> [suite flags]');
     process.exit(1);
 }

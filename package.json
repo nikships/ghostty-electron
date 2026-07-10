@@ -2,20 +2,16 @@
   "name": "ghostty-xterm-bench",
   "version": "0.1.0",
   "private": true,
-  "description": "Benchmark: cat a 1MB file in Electron — xterm.js (WebGL, in-renderer) vs libghostty + native IOSurface producer via Electron sharedTexture",
+  "description": "Ghostty embedded headlessly in Electron: ghostty owns PTY, parsing, fonts, Metal rendering \u2014 frames enter the DOM zero-copy via sharedTexture. Plus DOM-terminal benchmarks (xterm.js, ghostty-web).",
   "scripts": {
-    "postinstall": "node scripts/postinstall.js",
     "payload": "node scripts/gen-payload.js",
     "setup:ghostty": "bash scripts/setup-ghostty.sh",
-    "build:native": "cd native && node-gyp rebuild",
+    "build:native": "cd native/ghostty-renderer && node-gyp rebuild",
     "bench": "node bench/run.js flood",
-    "bench:parse": "node bench/run.js parse",
-    "bench:pty": "node bench/run.js pty",
-    "demo": "electron demo/main.js",
-    "test": "node --test test/addon.test.js test/conformance.test.js test/fuzz.test.js",
+    "demo": "electron demo-ghostty-renderer/main.js",
+    "test": "node --test test/embedded.test.js",
     "test:integration": "node --test test/integration.test.js",
-    "bench:stock": "node scripts/bench-stock.js",
-    "bench:render": "node scripts/bench-render-stress.js"
+    "bench:stock": "node scripts/bench-stock.js"
   },
   "devDependencies": {
     "@electron/rebuild": "^4.1.0",
@@ -25,7 +21,6 @@
     "@xterm/xterm": "^6.1.0-beta.288",
     "electron": "42.5.0",
     "ghostty-web": "^0.4.0",
-    "node-gyp": "^11.0.0",
-    "node-pty": "^1.1.0"
+    "node-gyp": "^11.0.0"
   }
 }

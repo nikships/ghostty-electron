@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# Clone ghostty and build libghostty-vt as a static library into
-# vendor/ghostty/zig-out ready for the native addon to link against.
+# Clone ghostty (pinned), apply our fork patches (headless embedding
+# platform), and build the full libghostty static library (terminal +
+# fonts + Metal renderer) that the N-API addon links against.
+#
+# The build runs on any OS (the library cross-compiles), but headless
+# rendering currently works on macOS only (Metal); Linux needs the
+# EGL/GBM presenter — see docs/ghostty-renderer-reuse.md.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+PIN=c41c6b81a4642ccba18d47b375d9495664de72a0
+
 if [ ! -d vendor/ghostty ]; then
-  git clone --depth 1 https://github.com/ghostty-org/ghostty vendor/ghostty
+  git clone https://github.com/ghostty-org/ghostty vendor/ghostty
+  git -C vendor/ghostty checkout "$PIN"
 fi
 
-cd vendor/ghostty
-echo "building libghostty-vt (zig $(zig version))..."
-zig build -Demit-lib-vt=true -Doptimize=ReleaseFast
-ls -la zig-out/lib/
-echo "done."
+bash scripts/apply-ghostty-patches.sh

@@ -43,13 +43,6 @@ const BACKENDS = [
     // upstream ghostty-web behavior, and the gate exists to catch leaks in
     // THIS repo's native code, not to break CI on a third-party library.
     soakGate: false
-  },
-  {
-    key: 'ghostty',
-    resultKey: 'ghostty',
-    resultFile: 'ghostty.json',
-    name: 'libghostty-vt + IOSurface + sharedTexture',
-    kind: 'native'
   }
 ];
 

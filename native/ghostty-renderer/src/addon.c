@@ -1,0 +1,564 @@
+/**
+ * N-API wrapper around ghostty's embedding API with the headless
+ * platform (approach A from docs/ghostty-renderer-reuse.md).
+ *
+ * Ghostty owns EVERYTHING: PTY + child process, IO threads, VT
+ * parsing, key/mouse encoding, selection, fonts/shaping/atlas, GPU
+ * (Metal) rendering, damage tracking, and IOSurface presentation.
+ * This file is only marshalling around ghostty.h:
+ *
+ *   init()                                      once per process
+ *   create({cols?, widthPx, heightPx, scale, fontSize?, command?})
+ *   tick(h)                    drain ghostty's app loop (call often)
+ *   wakeupPending()            true if ghostty asked for a tick
+ *   draw(h)                    force a synchronous render
+ *   frame(h)  -> { handle: Buffer(IOSurfaceRef +1), width, height,
+ *                  scale } | null
+ *   readPixels(h) -> { width, height, data } (tests; BGRA copy)
+ *   size(h)   -> { cols, rows, widthPx, heightPx, cellWidth, cellHeight }
+ *   resize(h, widthPx, heightPx)      pixel size; ghostty derives grid
+ *   text(h, string)                   cooked text input (typing/paste)
+ *   key(h, {action, key, mods, text?, unshiftedCodepoint?})  raw key
+ *   mouseButton(h, action, button, mods)
+ *   mousePos(h, x, y, mods)           CSS->surface px, ghostty encodes
+ *   mouseScroll(h, x, y, dx, dy)      wheel: scrollback/alt-scroll/reports
+ *   processExited(h) -> bool
+ *   destroy(h)                        close surface + free
+ *
+ * The frame's IOSurfaceRef is retained (+1) by libghostty for us; we
+ * release the previous one on each frame() call.
+ */
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurface.h>
+
+#include <ghostty.h>
+#include <node_api.h>
+
+#define NAPI_CALL(env, call)                                               \
+  do {                                                                     \
+    if ((call) != napi_ok) {                                               \
+      napi_throw_error(env, NULL, #call " failed");                        \
+      return NULL;                                                         \
+    }                                                                      \
+  } while (0)
+
+/* ── ghostty runtime callbacks ─────────────────────────────────────────
+ * The embedder is "the runtime": ghostty calls these. We keep them
+ * minimal — wakeup sets a flag JS polls, everything else is a no-op
+ * (clipboard integration can come later via Electron's clipboard). */
+
+static bool g_inited = false;
+static volatile bool g_wakeup = false;
+
+static void cb_wakeup(void *ud) {
+  (void)ud;
+  g_wakeup = true;
+}
+
+static bool cb_action(ghostty_app_t app, ghostty_target_s target,
+                      ghostty_action_s action) {
+  (void)app;
+  (void)target;
+  (void)action;
+  return false; /* unhandled; ghostty proceeds with defaults */
+}
+
+static bool cb_read_clipboard(void *ud, ghostty_clipboard_e loc,
+                              void *state) {
+  (void)ud;
+  (void)loc;
+  (void)state;
+  return false;
+}
+
+static void cb_confirm_read_clipboard(void *ud, const char *str, void *state,
+                                      ghostty_clipboard_request_e req) {
+  (void)ud;
+  (void)str;
+  (void)state;
+  (void)req;
+}
+
+static void cb_write_clipboard(void *ud, ghostty_clipboard_e loc,
+                               const ghostty_clipboard_content_s *content,
+                               size_t len, bool confirm) {
+  (void)ud;
+  (void)loc;
+  (void)content;
+  (void)len;
+  (void)confirm;
+}
+
+static void cb_close_surface(void *ud, bool alive) {
+  (void)ud;
+  (void)alive;
+}
+
+typedef struct {
+  ghostty_app_t app;      /* one app per session keeps lifecycle simple */
+  ghostty_config_t config;
+  ghostty_surface_t surface;
+  void *last_surface;     /* previous frame's IOSurfaceRef */
+} Session;
+
+static void session_dispose(Session *s) {
+  if (s->last_surface) {
+    CFRelease(s->last_surface);
+    s->last_surface = NULL;
+  }
+  if (s->surface) {
+    ghostty_surface_free(s->surface);
+    s->surface = NULL;
+  }
+  if (s->app) {
+    /* Drain pending work (e.g. surface teardown) before freeing. */
+    ghostty_app_tick(s->app);
+    ghostty_app_free(s->app);
+    s->app = NULL;
+  }
+  if (s->config) {
+    ghostty_config_free(s->config);
+    s->config = NULL;
+  }
+}
+
+static void session_finalize(napi_env env, void *data, void *hint) {
+  (void)env;
+  (void)hint;
+  Session *s = data;
+  session_dispose(s);
+  free(s);
+}
+
+static Session *get_session(napi_env env, napi_value v) {
+  void *data = NULL;
+  if (napi_get_value_external(env, v, &data) != napi_ok || !data) {
+    napi_throw_error(env, NULL, "invalid session handle");
+    return NULL;
+  }
+  return data;
+}
+
+static uint32_t get_u32(napi_env env, napi_value obj, const char *name,
+                        uint32_t fallback) {
+  napi_value v;
+  uint32_t out = fallback;
+  if (napi_get_named_property(env, obj, name, &v) == napi_ok)
+    napi_get_value_uint32(env, v, &out);
+  return out;
+}
+
+static double get_f64(napi_env env, napi_value obj, const char *name,
+                      double fallback) {
+  napi_value v;
+  double out = fallback;
+  if (napi_get_named_property(env, obj, name, &v) == napi_ok)
+    napi_get_value_double(env, v, &out);
+  return out;
+}
+
+static bool get_str(napi_env env, napi_value obj, const char *name, char *buf,
+                    size_t cap) {
+  napi_value v;
+  size_t n;
+  if (napi_get_named_property(env, obj, name, &v) != napi_ok) return false;
+  napi_valuetype t;
+  if (napi_typeof(env, v, &t) != napi_ok || t != napi_string) return false;
+  return napi_get_value_string_utf8(env, v, buf, cap, &n) == napi_ok;
+}
+
+/* ── exports ──────────────────────────────────────────────────────── */
+
+/** init() — global ghostty init; call once before create(). */
+static napi_value InitGhostty(napi_env env, napi_callback_info info) {
+  (void)info;
+  if (!g_inited) {
+    static char arg0[] = "ghostty-electron";
+    static char *argv[] = {arg0};
+    if (ghostty_init(1, argv) != 0) {
+      napi_throw_error(env, NULL, "ghostty_init failed");
+      return NULL;
+    }
+    g_inited = true;
+  }
+  return NULL;
+}
+
+/**
+ * create(opts) -> external session
+ * opts: { widthPx, heightPx, scale, fontSize?, command? }
+ * The grid (cols/rows) is derived by ghostty from pixel size and cell
+ * metrics, exactly like a real window.
+ */
+static napi_value Create(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  if (!g_inited) {
+    napi_throw_error(env, NULL, "call init() first");
+    return NULL;
+  }
+
+  uint32_t width_px = get_u32(env, argv[0], "widthPx", 960);
+  uint32_t height_px = get_u32(env, argv[0], "heightPx", 480);
+  double scale = get_f64(env, argv[0], "scale", 2.0);
+  double font_size = get_f64(env, argv[0], "fontSize", 0);
+  char command[4096] = {0};
+  bool has_command = get_str(env, argv[0], "command", command,
+                             sizeof(command));
+
+  ghostty_config_t config = ghostty_config_new();
+  /* Self-contained: defaults only, no user config files. */
+  ghostty_config_finalize(config);
+
+  ghostty_runtime_config_s runtime = {0};
+  runtime.wakeup_cb = cb_wakeup;
+  runtime.action_cb = cb_action;
+  runtime.read_clipboard_cb = cb_read_clipboard;
+  runtime.confirm_read_clipboard_cb = cb_confirm_read_clipboard;
+  runtime.write_clipboard_cb = cb_write_clipboard;
+  runtime.close_surface_cb = cb_close_surface;
+
+  ghostty_app_t app = ghostty_app_new(&runtime, config);
+  if (!app) {
+    ghostty_config_free(config);
+    napi_throw_error(env, NULL, "ghostty_app_new failed");
+    return NULL;
+  }
+
+  ghostty_surface_config_s surface_config = ghostty_surface_config_new();
+  surface_config.platform_tag = GHOSTTY_PLATFORM_HEADLESS;
+  surface_config.platform.headless.reserved = NULL;
+  surface_config.scale_factor = scale;
+  if (font_size > 0) surface_config.font_size = (float)font_size;
+  if (has_command && command[0]) surface_config.command = command;
+
+  ghostty_surface_t surface = ghostty_surface_new(app, &surface_config);
+  if (!surface) {
+    ghostty_app_free(app);
+    ghostty_config_free(config);
+    napi_throw_error(env, NULL, "ghostty_surface_new failed");
+    return NULL;
+  }
+
+  ghostty_surface_set_content_scale(surface, scale, scale);
+  ghostty_surface_set_size(surface, width_px, height_px);
+  ghostty_surface_set_focus(surface, true);
+
+  Session *s = calloc(1, sizeof(Session));
+  s->app = app;
+  s->config = config;
+  s->surface = surface;
+
+  napi_value external;
+  NAPI_CALL(env,
+            napi_create_external(env, s, session_finalize, NULL, &external));
+  return external;
+}
+
+/** destroy(h) — synchronous teardown (kills the child via surface_free). */
+static napi_value Destroy(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+  session_dispose(s);
+  return NULL;
+}
+
+/** tick(h) — drain ghostty's app loop. Call on wakeup + periodically. */
+static napi_value Tick(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->app) return NULL;
+  g_wakeup = false;
+  ghostty_app_tick(s->app);
+  return NULL;
+}
+
+/** wakeupPending() -> bool — ghostty requested a tick. */
+static napi_value WakeupPending(napi_env env, napi_callback_info info) {
+  (void)info;
+  napi_value out;
+  NAPI_CALL(env, napi_get_boolean(env, g_wakeup, &out));
+  return out;
+}
+
+/** draw(h) — force a synchronous render of current state. */
+static napi_value Draw(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+  ghostty_surface_draw(s->surface);
+  return NULL;
+}
+
+/** frame(h) -> { handle, width, height, scale } | null */
+static napi_value Frame(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  ghostty_headless_frame_s frame =
+      ghostty_surface_headless_frame(s->surface);
+  if (!frame.iosurface) {
+    napi_value null_val;
+    NAPI_CALL(env, napi_get_null(env, &null_val));
+    return null_val;
+  }
+
+  if (s->last_surface) CFRelease(s->last_surface);
+  s->last_surface = frame.iosurface; /* keep +1 until next frame() */
+
+  napi_value result, v, handle;
+  NAPI_CALL(env, napi_create_object(env, &result));
+  NAPI_CALL(env, napi_create_buffer_copy(env, sizeof(void *),
+                                         &frame.iosurface, NULL, &handle));
+  NAPI_CALL(env, napi_set_named_property(env, result, "handle", handle));
+  NAPI_CALL(env, napi_create_uint32(env, frame.width_px, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "width", v));
+  NAPI_CALL(env, napi_create_uint32(env, frame.height_px, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "height", v));
+  NAPI_CALL(env, napi_create_double(env, frame.scale, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "scale", v));
+  return result;
+}
+
+/** readPixels(h) -> { width, height, data } — BGRA copy, for tests. */
+static napi_value ReadPixels(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  ghostty_headless_frame_s frame =
+      ghostty_surface_headless_frame(s->surface);
+  if (!frame.iosurface) {
+    napi_value null_val;
+    NAPI_CALL(env, napi_get_null(env, &null_val));
+    return null_val;
+  }
+
+  IOSurfaceRef surf = (IOSurfaceRef)frame.iosurface;
+  IOSurfaceLock(surf, kIOSurfaceLockReadOnly, NULL);
+  const uint8_t *base = IOSurfaceGetBaseAddress(surf);
+  size_t stride = IOSurfaceGetBytesPerRow(surf);
+  size_t w = IOSurfaceGetWidth(surf), h = IOSurfaceGetHeight(surf);
+
+  napi_value data;
+  void *out;
+  NAPI_CALL(env, napi_create_buffer(env, w * h * 4, &out, &data));
+  for (size_t y = 0; y < h; y++)
+    memcpy((uint8_t *)out + y * w * 4, base + y * stride, w * 4);
+  IOSurfaceUnlock(surf, kIOSurfaceLockReadOnly, NULL);
+  CFRelease(surf);
+
+  napi_value result, v;
+  NAPI_CALL(env, napi_create_object(env, &result));
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)w, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "width", v));
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)h, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "height", v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "data", data));
+  return result;
+}
+
+/** size(h) -> grid + pixel + cell metrics (ghostty derives the grid). */
+static napi_value GetSize(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  ghostty_surface_size_s sz = ghostty_surface_size(s->surface);
+  napi_value result, v;
+  NAPI_CALL(env, napi_create_object(env, &result));
+#define SET(name, val)                                                     \
+  NAPI_CALL(env, napi_create_uint32(env, (uint32_t)(val), &v));            \
+  NAPI_CALL(env, napi_set_named_property(env, result, name, v));
+  SET("cols", sz.columns)
+  SET("rows", sz.rows)
+  SET("widthPx", sz.width_px)
+  SET("heightPx", sz.height_px)
+  SET("cellWidth", sz.cell_width_px)
+  SET("cellHeight", sz.cell_height_px)
+#undef SET
+  return result;
+}
+
+/** resize(h, widthPx, heightPx) — ghostty reflows + resizes PTY. */
+static napi_value Resize(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  uint32_t w, h;
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[1], &w));
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[2], &h));
+  ghostty_surface_set_size(s->surface, w, h);
+  return NULL;
+}
+
+/** text(h, string) — cooked text input (typing, paste). */
+static napi_value Text(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  char buf[8192];
+  size_t n;
+  NAPI_CALL(env,
+            napi_get_value_string_utf8(env, argv[1], buf, sizeof(buf), &n));
+  ghostty_surface_text(s->surface, buf, n);
+  return NULL;
+}
+
+/**
+ * key(h, {action, key, mods, text?, unshiftedCodepoint?}) -> bool
+ * action: 0=release 1=press 2=repeat; key: ghostty_input_key_e;
+ * mods: ghostty_input_mods_e bitmask. Goes through ghostty's full
+ * key encoder (kitty protocol, mode-aware arrows, etc.).
+ */
+static napi_value Key(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  char text[64] = {0};
+  bool has_text = get_str(env, argv[1], "text", text, sizeof(text));
+
+  ghostty_input_key_s key = {0};
+  key.action = (ghostty_input_action_e)get_u32(env, argv[1], "action", 1);
+  key.keycode = get_u32(env, argv[1], "keycode", 0);
+  key.mods = (ghostty_input_mods_e)get_u32(env, argv[1], "mods", 0);
+  key.consumed_mods =
+      (ghostty_input_mods_e)get_u32(env, argv[1], "consumedMods", 0);
+  key.text = has_text && text[0] ? text : NULL;
+  key.unshifted_codepoint = get_u32(env, argv[1], "unshiftedCodepoint", 0);
+  key.composing = false;
+
+  napi_value out;
+  NAPI_CALL(env, napi_get_boolean(env, ghostty_surface_key(s->surface, key),
+                                  &out));
+  return out;
+}
+
+/** mouseButton(h, action, button, mods) — 1=press 0=release. */
+static napi_value MouseButton(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  uint32_t action, button, mods;
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[1], &action));
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[2], &button));
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[3], &mods));
+  ghostty_surface_mouse_button(s->surface,
+                               (ghostty_input_mouse_state_e)action,
+                               (ghostty_input_mouse_button_e)button,
+                               (ghostty_input_mods_e)mods);
+  return NULL;
+}
+
+/** mousePos(h, x, y, mods) — surface-px position. */
+static napi_value MousePos(napi_env env, napi_callback_info info) {
+  size_t argc = 4;
+  napi_value argv[4];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  double x, y;
+  uint32_t mods;
+  NAPI_CALL(env, napi_get_value_double(env, argv[1], &x));
+  NAPI_CALL(env, napi_get_value_double(env, argv[2], &y));
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[3], &mods));
+  ghostty_surface_mouse_pos(s->surface, x, y, (ghostty_input_mods_e)mods);
+  return NULL;
+}
+
+/** mouseScroll(h, x, y, dx, dy) — ghostty routes scrollback/alt/reports. */
+static napi_value MouseScroll(napi_env env, napi_callback_info info) {
+  size_t argc = 5;
+  napi_value argv[5];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  double x, y, dx, dy;
+  NAPI_CALL(env, napi_get_value_double(env, argv[1], &x));
+  NAPI_CALL(env, napi_get_value_double(env, argv[2], &y));
+  NAPI_CALL(env, napi_get_value_double(env, argv[3], &dx));
+  NAPI_CALL(env, napi_get_value_double(env, argv[4], &dy));
+  ghostty_surface_mouse_pos(s->surface, x, y, 0);
+  ghostty_input_scroll_mods_t mods = 0;
+  ghostty_surface_mouse_scroll(s->surface, dx, dy, mods);
+  return NULL;
+}
+
+/** processExited(h) -> bool */
+static napi_value ProcessExited(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  napi_value out;
+  NAPI_CALL(env, napi_get_boolean(
+                     env, ghostty_surface_process_exited(s->surface), &out));
+  return out;
+}
+
+static napi_value Init(napi_env env, napi_value exports) {
+  napi_property_descriptor props[] = {
+      {"init", NULL, InitGhostty, NULL, NULL, NULL, napi_default, NULL},
+      {"create", NULL, Create, NULL, NULL, NULL, napi_default, NULL},
+      {"destroy", NULL, Destroy, NULL, NULL, NULL, napi_default, NULL},
+      {"tick", NULL, Tick, NULL, NULL, NULL, napi_default, NULL},
+      {"wakeupPending", NULL, WakeupPending, NULL, NULL, NULL, napi_default,
+       NULL},
+      {"draw", NULL, Draw, NULL, NULL, NULL, napi_default, NULL},
+      {"frame", NULL, Frame, NULL, NULL, NULL, napi_default, NULL},
+      {"readPixels", NULL, ReadPixels, NULL, NULL, NULL, napi_default, NULL},
+      {"size", NULL, GetSize, NULL, NULL, NULL, napi_default, NULL},
+      {"resize", NULL, Resize, NULL, NULL, NULL, napi_default, NULL},
+      {"text", NULL, Text, NULL, NULL, NULL, napi_default, NULL},
+      {"key", NULL, Key, NULL, NULL, NULL, napi_default, NULL},
+      {"mouseButton", NULL, MouseButton, NULL, NULL, NULL, napi_default,
+       NULL},
+      {"mousePos", NULL, MousePos, NULL, NULL, NULL, napi_default, NULL},
+      {"mouseScroll", NULL, MouseScroll, NULL, NULL, NULL, napi_default,
+       NULL},
+      {"processExited", NULL, ProcessExited, NULL, NULL, NULL, napi_default,
+       NULL},
+  };
+  napi_define_properties(env, exports, sizeof(props) / sizeof(props[0]),
+                         props);
+  return exports;
+}
+
+NAPI_MODULE(ghostty_renderer, Init)

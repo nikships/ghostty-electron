@@ -8,8 +8,7 @@
  *               forcing steady-state parse+render interleaving
  *
  * DOM backends run through bench/flood-dom-main.js (one Electron app,
- * parameterized); the native backend through bench/flood-native-main.js.
- * A backend that can't run here (e.g. the native producer on Linux) is
+ * parameterized). A backend that can't run here is
  * reported and skipped — the comparison degrades, never breaks.
  *
  * Usage: node bench/flood.js [--runs N] [--repeat N] [--screenshot] [--burst-only]
@@ -37,9 +36,9 @@ if (!fs.existsSync(path.join(ROOT, 'payload.txt'))) {
 }
 
 function entryArgs(backend) {
-  return backend.kind === 'dom'
-    ? [path.join(__dirname, 'flood-dom-main.js'), '--backend', backend.key]
-    : [path.join(__dirname, 'flood-native-main.js')];
+  // Only DOM backends remain; the native producer was replaced by the
+  // headless ghostty embedding (see demo-ghostty-renderer/).
+  return [path.join(__dirname, 'flood-dom-main.js'), '--backend', backend.key];
 }
 
 function runOnce(backend, extraArgs) {
