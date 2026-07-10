@@ -30,13 +30,19 @@ VS Code's terminal keeps everything — VT parsing, buffer state,
 rendering — on the renderer process's JavaScript thread. Heavy output
 floods are parse-bound in JS and saturate the same thread that handles
 keystrokes, so the terminal feels worst exactly when it's busiest.
-Proposals to swap in a native terminal engine were historically
-dismissed as "you'd have to fork Chromium to get native pixels into the
-DOM" (microsoft/vscode#236991 was closed as out of scope).
+Proposals to swap ghostty in as VS Code's terminal
+(microsoft/vscode#236991) were closed as out of scope — for good
+reasons that are mostly *not* about rendering: maintenance control
+over a critical component, xterm.js's decade of tailored engineering,
+the frontend/backend split that Remote/Codespaces depend on. But one
+technical premise in that discussion space was always assumed: a
+native engine has no way to get its pixels into a sandboxed renderer's
+DOM without copying or forking Chromium.
 
-That premise changed with Electron's `sharedTexture` module. This repo
-is the working proof — plus an attempt to measure honestly what the
-architecture buys and what it doesn't.
+That specific premise changed with Electron's `sharedTexture` module.
+This repo is the working proof — plus an attempt to measure honestly
+what the architecture buys and what it doesn't. (The non-rendering
+reasons above still stand; this is research, not a VS Code proposal.)
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="assets/benchmarks-dark.svg">
