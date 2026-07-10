@@ -18,12 +18,14 @@ loop, forward input, ship each presented frame.
 By default the engine doesn't even run in the Electron main process:
 `host.js` runs the whole terminal in an Electron **utilityProcess**, so
 a busy or crashed terminal can't stall window management. Frames cross
-the process boundary as global IOSurface IDs (a `uint32` over
-`parentPort`); the main process re-derives a local `IOSurfaceRef` via
-`IOSurfaceLookup` and imports it into `sharedTexture` — still zero-copy,
-the pixels never leave the GPU. Set `engine: 'main'` to run the engine
-in-process (the original mode; tests use it for synchronous pixel
-assertions).
+the process boundary as **mach send-rights**
+(`IOSurfaceCreateMachPort` → bootstrap channel →
+`IOSurfaceLookupFromMachPort`) — an unguessable capability, per
+Apple's recommended mechanism for passing surfaces between tasks; the
+main process imports each received surface into `sharedTexture` —
+still zero-copy, the pixels never leave the GPU. Set `engine: 'main'`
+to run the engine in-process (the original mode; tests use it for
+synchronous pixel assertions).
 
 macOS-only for now (Metal + IOSurface). Linux needs an EGL/GBM
 presenter (probe experiments in `native/renderer-poc/`); Windows has
@@ -32,11 +34,6 @@ iteration had a working D3D11/DirectWrite producer, last at repo
 commit `1a4357c`. See `docs/ghostty-renderer-reuse.md` at the repo
 root.
 
-⚠️ **Security caveat:** frames cross the engine→main process boundary
-as *global* IOSurfaces (`kIOSurfaceIsGlobal`, patch `0002`), meaning
-any local process that guesses a surface ID can read the terminal's
-pixels. Acceptable for research, not for shipping; the production path
-is an `IOSurfaceCreateMachPort` handoff.
 
 ## Usage
 

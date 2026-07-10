@@ -5,21 +5,32 @@
  * Runs the entire terminal engine (ghostty: PTY + shell, VT parsing,
  * input encoding, fonts, Metal rendering) OUTSIDE the Electron main
  * process, so a busy or crashing terminal can't stall window
- * management. The main process stays a thin presenter: we post the
- * global IOSurfaceID of each presented frame over parentPort; the main
- * side re-derives a local IOSurfaceRef via IOSurfaceLookup and imports
- * it into sharedTexture — still zero-copy, frames never leave the GPU.
+ * management. The main process stays a thin presenter: it receives
+ * each presented frame as a mach send-right and imports it into
+ * sharedTexture — still zero-copy, frames never leave the GPU.
+ *
+ * Frame handoff: per frame, the IOSurface crosses the process
+ * boundary as a mach send-right (IOSurfaceCreateMachPort) over a
+ * bootstrap-registered channel — an unguessable capability, unlike
+ * the deprecated global-IOSurface IDs. The mach message is sent
+ * FIRST, then a 'frame' JS message with the metadata; the parent
+ * receives the (already queued) port on handling the JS message.
  *
  * Frame flow control: one frame in flight — we don't post the next
  * frame until the parent acks the previous one, so a slow presenter
  * degrades to skipped frames instead of a queue of stale messages.
+ * The in-flight frame's port holds +1 on the surface's global use
+ * count, so it can't be recycled mid-transfer.
  *
  * Protocol (parentPort messages, all {type, ...}):
  *   in : create {opts} | frame-ack | key/text/mouse-* {..} |
  *        resize {widthPx,heightPx} | draw | read-pixels {id} |
  *        size {id} | destroy
- *   out: created | frame {surfaceId,width,height,scale} | exit |
+ *   out: created | frame {seq,width,height,scale} | exit |
  *        reply {id, result} | error {message}
+ *
+ * The mach channel name arrives in ELECTRON_GHOSTTY_MACH_CHANNEL
+ * (set by the parent before fork).
  */
 const { load } = require('./addon');
 
@@ -28,11 +39,15 @@ const PRESENT_INTERVAL_MS = 8; // ~120Hz poll of ghostty's swap chain
 const addon = load();
 addon.init();
 
+const sender = addon.machSenderOpen(
+  process.env.ELECTRON_GHOSTTY_MACH_CHANNEL, 5000);
+
 let session = null;
 let presentTimer = null;
 let lastFramePtr = null;
 let awaitingAck = false;
 let exited = false;
+let frameSeq = 0;
 
 function post(msg) {
   process.parentPort.postMessage(msg);
@@ -57,10 +72,15 @@ function presentTick() {
   const ptr = frame.handle.toString('hex');
   if (ptr === lastFramePtr) return;
   lastFramePtr = ptr;
+  // Mach message first (the port right travels out-of-band), then the
+  // JS metadata message. If the mach send fails (parent gone, queue
+  // full) skip this frame — the swap chain will produce another.
+  const seq = ++frameSeq;
+  if (!addon.machSendSurface(sender, frame.handle, seq)) return;
   awaitingAck = true;
   post({
     type: 'frame',
-    surfaceId: frame.surfaceId,
+    seq,
     width: frame.width,
     height: frame.height,
     scale: frame.scale,

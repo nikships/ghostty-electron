@@ -30,11 +30,15 @@
  */
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOSurface/IOSurface.h>
+#include <mach/mach.h>
+#include <servers/bootstrap.h>
 
 #include <ghostty.h>
 #include <node_api.h>
@@ -323,7 +327,7 @@ static napi_value Draw(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
-/** frame(h) -> { handle, surfaceId, width, height, scale } | null */
+/** frame(h) -> { handle, width, height, scale } | null */
 static napi_value Frame(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
@@ -347,12 +351,6 @@ static napi_value Frame(napi_env env, napi_callback_info info) {
   NAPI_CALL(env, napi_create_buffer_copy(env, sizeof(void *),
                                          &frame.iosurface, NULL, &handle));
   NAPI_CALL(env, napi_set_named_property(env, result, "handle", handle));
-  /* Global IOSurfaceID: another process (Electron's main process, when
-   * ghostty runs in a utilityProcess) re-derives a local IOSurfaceRef
-   * via IOSurfaceLookup. Headless targets are created IsGlobal. */
-  NAPI_CALL(env, napi_create_uint32(
-                     env, IOSurfaceGetID((IOSurfaceRef)frame.iosurface), &v));
-  NAPI_CALL(env, napi_set_named_property(env, result, "surfaceId", v));
   NAPI_CALL(env, napi_create_uint32(env, frame.width_px, &v));
   NAPI_CALL(env, napi_set_named_property(env, result, "width", v));
   NAPI_CALL(env, napi_create_uint32(env, frame.height_px, &v));
@@ -544,35 +542,246 @@ static napi_value MouseScroll(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
-/**
- * surfaceLookup(surfaceId) -> Buffer(IOSurfaceRef, +1) | null
- * Re-derives a process-local IOSurfaceRef from a global IOSurfaceID
- * (frames produced by ghostty running in ANOTHER process, e.g. an
- * Electron utilityProcess). Caller must surfaceRelease() the handle
- * when done. Pure IOSurface — needs no ghostty init.
+/* ── cross-process IOSurface handoff via mach ports ─────────────────
+ *
+ * IOSurfaceRefs are process-local; frames produced by ghostty in a
+ * utilityProcess must be re-derived in the presenting process.
+ * IOSurfaceCreateMachPort / IOSurfaceLookupFromMachPort is Apple's
+ * sanctioned way to pass a surface "atomically or securely ... to
+ * another task" (IOSurfaceRef.h) — unlike the deprecated
+ * kIOSurfaceIsGlobal, the port is an unguessable capability.
+ *
+ * Electron's parentPort can't carry mach send-rights, so the channel
+ * is built here: the PARENT allocates a receive port and registers it
+ * with the per-session bootstrap server under a unique name
+ * (machChannelCreate); the HOST looks the name up (machSenderOpen)
+ * and, per frame, moves one IOSurface port right + an inline seq via
+ * mach_msg (machSendSurface). The host sends the mach message BEFORE
+ * posting the 'frame' JS message, and the flow control is
+ * one-frame-in-flight, so when the parent handles the JS message a
+ * single mach message is already queued: machChannelReceiveSurface is
+ * a bounded-timeout receive, no dedicated thread needed.
+ *
+ * A live port created from an IOSurface holds +1 on the surface's
+ * global use count, so the frame can't be recycled mid-transfer even
+ * across a resize; both sides deallocate their right promptly.
  */
-static napi_value SurfaceLookup(napi_env env, napi_callback_info info) {
+
+typedef struct {
+  mach_msg_header_t header;
+  mach_msg_body_t body;
+  mach_msg_port_descriptor_t port;
+  uint64_t seq;
+} FrameMsg;
+
+typedef struct {
+  FrameMsg msg;
+  mach_msg_trailer_t trailer;
+} FrameMsgRecv;
+
+/** machChannelCreate(name) -> external — parent side; registers a
+ * receive port with bootstrap under `name`. */
+static void channel_finalize(napi_env env, void *data, void *hint) {
+  (void)env;
+  (void)hint;
+  mach_port_t port = (mach_port_t)(uintptr_t)data;
+  if (port != MACH_PORT_NULL)
+    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+}
+
+static napi_value MachChannelCreate(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
   NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  char name[128];
+  size_t n;
+  NAPI_CALL(env,
+            napi_get_value_string_utf8(env, argv[0], name, sizeof(name), &n));
 
-  uint32_t id;
-  NAPI_CALL(env, napi_get_value_uint32(env, argv[0], &id));
+  mach_port_t port = MACH_PORT_NULL;
+  kern_return_t kr =
+      mach_port_allocate(mach_task_self(), MACH_PORT_RIGHT_RECEIVE, &port);
+  if (kr != KERN_SUCCESS) {
+    napi_throw_error(env, NULL, "mach_port_allocate failed");
+    return NULL;
+  }
+  kr = mach_port_insert_right(mach_task_self(), port, port,
+                              MACH_MSG_TYPE_MAKE_SEND);
+  if (kr != KERN_SUCCESS) {
+    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+    napi_throw_error(env, NULL, "mach_port_insert_right failed");
+    return NULL;
+  }
+  /* bootstrap_register is marked deprecated (launchd wants static
+   * registrations) but remains the supported dynamic-name mechanism
+   * for exactly this parent/child rendezvous shape. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+  kr = bootstrap_register(bootstrap_port, name, port);
+#pragma clang diagnostic pop
+  /* The bootstrap server took its own right; drop the one we made. */
+  mach_port_deallocate(mach_task_self(), port);
+  if (kr != KERN_SUCCESS) {
+    mach_port_mod_refs(mach_task_self(), port, MACH_PORT_RIGHT_RECEIVE, -1);
+    napi_throw_error(env, NULL, "bootstrap_register failed");
+    return NULL;
+  }
 
-  IOSurfaceRef surf = IOSurfaceLookup((IOSurfaceID)id); /* returns +1 */
+  napi_value external;
+  NAPI_CALL(env, napi_create_external(env, (void *)(uintptr_t)port,
+                                      channel_finalize, NULL, &external));
+  return external;
+}
+
+/**
+ * machChannelReceiveSurface(channel, timeoutMs)
+ *   -> { handle: Buffer(IOSurfaceRef +1), seq } | null (timeout)
+ * Caller must surfaceRelease() the handle when done presenting.
+ */
+static napi_value MachChannelReceiveSurface(napi_env env,
+                                            napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  void *data = NULL;
+  NAPI_CALL(env, napi_get_value_external(env, argv[0], &data));
+  mach_port_t port = (mach_port_t)(uintptr_t)data;
+  uint32_t timeout_ms = 1000;
+  napi_get_value_uint32(env, argv[1], &timeout_ms);
+
+  FrameMsgRecv recv;
+  memset(&recv, 0, sizeof(recv));
+  recv.msg.header.msgh_size = sizeof(recv);
+  recv.msg.header.msgh_local_port = port;
+  kern_return_t kr =
+      mach_msg(&recv.msg.header, MACH_RCV_MSG | MACH_RCV_TIMEOUT, 0,
+               sizeof(recv), port, timeout_ms, MACH_PORT_NULL);
+  if (kr != KERN_SUCCESS) {
+    napi_value null_val;
+    NAPI_CALL(env, napi_get_null(env, &null_val));
+    return null_val;
+  }
+
+  mach_port_t surf_port = recv.msg.port.name;
+  IOSurfaceRef surf = IOSurfaceLookupFromMachPort(surf_port); /* +1 */
+  mach_port_deallocate(mach_task_self(), surf_port);
   if (!surf) {
     napi_value null_val;
     NAPI_CALL(env, napi_get_null(env, &null_val));
     return null_val;
   }
 
-  napi_value handle;
+  napi_value result, handle, v;
+  NAPI_CALL(env, napi_create_object(env, &result));
   NAPI_CALL(env,
             napi_create_buffer_copy(env, sizeof(void *), &surf, NULL, &handle));
-  return handle;
+  NAPI_CALL(env, napi_set_named_property(env, result, "handle", handle));
+  NAPI_CALL(env, napi_create_double(env, (double)recv.msg.seq, &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "seq", v));
+  return result;
 }
 
-/** surfaceRelease(handle) — CFRelease a surfaceLookup() handle. */
+/** machSenderOpen(name, timeoutMs) -> external — host side; looks up
+ * the parent's channel (retries until the parent has registered). */
+static void sender_finalize(napi_env env, void *data, void *hint) {
+  (void)env;
+  (void)hint;
+  mach_port_t port = (mach_port_t)(uintptr_t)data;
+  if (port != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), port);
+}
+
+static napi_value MachSenderOpen(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  char name[128];
+  size_t n;
+  NAPI_CALL(env,
+            napi_get_value_string_utf8(env, argv[0], name, sizeof(name), &n));
+  uint32_t timeout_ms = 5000;
+  napi_get_value_uint32(env, argv[1], &timeout_ms);
+
+  mach_port_t send_port = MACH_PORT_NULL;
+  kern_return_t kr = KERN_FAILURE;
+  /* The parent registers before forking us, so the first try should
+   * hit; retry briefly to be robust against races. */
+  for (uint32_t waited = 0;; waited += 50) {
+    kr = bootstrap_look_up(bootstrap_port, name, &send_port);
+    if (kr == KERN_SUCCESS || waited >= timeout_ms) break;
+    usleep(50 * 1000);
+  }
+  if (kr != KERN_SUCCESS) {
+    napi_throw_error(env, NULL, "bootstrap_look_up failed");
+    return NULL;
+  }
+
+  napi_value external;
+  NAPI_CALL(env, napi_create_external(env, (void *)(uintptr_t)send_port,
+                                      sender_finalize, NULL, &external));
+  return external;
+}
+
+/**
+ * machSendSurface(sender, surfaceHandle, seq) -> bool
+ * Wraps the IOSurface in a mach port and moves the right to the
+ * parent. Returns false if the send failed (parent gone / queue full);
+ * the caller should skip the frame, not crash.
+ */
+static napi_value MachSendSurface(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  void *data = NULL;
+  NAPI_CALL(env, napi_get_value_external(env, argv[0], &data));
+  mach_port_t send_port = (mach_port_t)(uintptr_t)data;
+
+  void *buf = NULL;
+  size_t len = 0;
+  NAPI_CALL(env, napi_get_buffer_info(env, argv[1], &buf, &len));
+  if (len != sizeof(void *)) {
+    napi_throw_error(env, NULL, "invalid surface handle");
+    return NULL;
+  }
+  IOSurfaceRef surf;
+  memcpy(&surf, buf, sizeof(void *));
+
+  double seq_d = 0;
+  NAPI_CALL(env, napi_get_value_double(env, argv[2], &seq_d));
+
+  mach_port_t surf_port = IOSurfaceCreateMachPort(surf);
+  napi_value out;
+  if (surf_port == MACH_PORT_NULL) {
+    NAPI_CALL(env, napi_get_boolean(env, false, &out));
+    return out;
+  }
+
+  FrameMsg msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.header.msgh_bits =
+      MACH_MSGH_BITS_SET(MACH_MSG_TYPE_COPY_SEND, 0, 0, MACH_MSGH_BITS_COMPLEX);
+  msg.header.msgh_size = sizeof(msg);
+  msg.header.msgh_remote_port = send_port;
+  msg.body.msgh_descriptor_count = 1;
+  msg.port.name = surf_port;
+  msg.port.disposition = MACH_MSG_TYPE_MOVE_SEND;
+  msg.port.type = MACH_MSG_PORT_DESCRIPTOR;
+  msg.seq = (uint64_t)seq_d;
+
+  kern_return_t kr = mach_msg(&msg.header, MACH_SEND_MSG | MACH_SEND_TIMEOUT,
+                              sizeof(msg), 0, MACH_PORT_NULL, 100 /* ms */,
+                              MACH_PORT_NULL);
+  if (kr != KERN_SUCCESS) {
+    /* MOVE_SEND didn't happen; drop our right so the surface's global
+     * use count doesn't leak. */
+    mach_port_deallocate(mach_task_self(), surf_port);
+    NAPI_CALL(env, napi_get_boolean(env, false, &out));
+    return out;
+  }
+  NAPI_CALL(env, napi_get_boolean(env, true, &out));
+  return out;
+}
+
+/** surfaceRelease(handle) — CFRelease a received surface handle. */
 static napi_value SurfaceRelease(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
@@ -627,8 +836,14 @@ static napi_value Init(napi_env env, napi_value exports) {
       {"mousePos", NULL, MousePos, NULL, NULL, NULL, napi_default, NULL},
       {"mouseScroll", NULL, MouseScroll, NULL, NULL, NULL, napi_default,
        NULL},
-      {"surfaceLookup", NULL, SurfaceLookup, NULL, NULL, NULL, napi_default,
+      {"machChannelCreate", NULL, MachChannelCreate, NULL, NULL, NULL,
+       napi_default, NULL},
+      {"machChannelReceiveSurface", NULL, MachChannelReceiveSurface, NULL,
+       NULL, NULL, napi_default, NULL},
+      {"machSenderOpen", NULL, MachSenderOpen, NULL, NULL, NULL, napi_default,
        NULL},
+      {"machSendSurface", NULL, MachSendSurface, NULL, NULL, NULL,
+       napi_default, NULL},
       {"surfaceRelease", NULL, SurfaceRelease, NULL, NULL, NULL, napi_default,
        NULL},
       {"processExited", NULL, ProcessExited, NULL, NULL, NULL, napi_default,

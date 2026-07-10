@@ -145,26 +145,27 @@ embedding is the main open workstream.
                                                    └───────────────────┘
 ```
 
-Two small patches to a pinned ghostty checkout make this possible
-(`patches/`, applied by `npm run setup:ghostty`):
+One small patch to a pinned ghostty checkout makes this possible
+(`patches/0001`, applied by `npm run setup:ghostty`): the headless
+apprt platform — `GHOSTTY_PLATFORM_HEADLESS` (a surface with no
+NSView; the Metal backend's IOSurfaceLayer works standalone) plus
+`ghostty_surface_headless_frame()` returning the last presented
+IOSurface. This is the piece worth proposing upstream — small,
+additive, independently useful for screenshots, testing, and
+embedding.
 
-1. **`0001` — headless apprt platform.** `GHOSTTY_PLATFORM_HEADLESS`
-   (a surface with no NSView; the Metal backend's IOSurfaceLayer works
-   standalone) plus `ghostty_surface_headless_frame()` returning the
-   last presented IOSurface. This is the piece worth proposing
-   upstream — small, additive, independently useful for screenshots,
-   testing, and embedding.
-2. **`0002` — global IOSurfaces for headless targets.** Frames must be
-   representable cross-process; `kIOSurfaceIsGlobal` makes a frame a
-   lookup-able `uint32`. ⚠️ Deprecated by Apple and **insecure** (any
-   local process that guesses an ID can read the terminal's pixels) —
-   acceptable for research, not for shipping. The production path is a
-   mach-port handoff (`IOSurfaceCreateMachPort`), which needs a small
-   native channel since Electron's `parentPort` can't carry mach
-   send-rights.
+Frames cross the engine→main process boundary as **mach send-rights**
+(`IOSurfaceCreateMachPort` in the host, a bootstrap-registered channel
+— Electron's `parentPort` can't carry mach rights —
+`IOSurfaceLookupFromMachPort` in the parent). That's Apple's
+recommended mechanism for passing a surface "atomically or securely to
+another task": an unguessable capability, no fork patch needed. Each
+in-flight port holds +1 on the surface's global use count, so a frame
+can't be recycled mid-transfer.
 
-The N-API addon (`packages/electron-ghostty/src/addon.c`, ~700 lines)
-is pure marshalling around `ghostty.h` — ghostty does the work.
+The N-API addon (`packages/electron-ghostty/src/addon.c`, ~900 lines)
+is marshalling around `ghostty.h` plus that mach channel — ghostty
+does the work.
 
 ## Platform matrix (honest)
 
@@ -228,8 +229,6 @@ native/renderer-poc/        Linux EGL/headless probe experiments
 ## Caveats
 
 - Research-grade. The package is not published and its API will change.
-- Patch `0002`'s global IOSurfaces mean terminal pixels are readable by
-  any local process — do not ship this as-is (see above).
 - ghostty is pinned (`scripts/setup-ghostty.sh`); the embedding pokes
   one private detail (the IOSurfaceLayer `contents` property) that an
   upstream API should replace.

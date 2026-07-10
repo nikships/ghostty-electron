@@ -21,11 +21,11 @@
  *
  * Engine placement — opts.engine:
  *   'utility' (default)  the whole engine runs in an Electron
- *       utilityProcess (host.js); the main process only re-derives
- *       each presented frame from its global IOSurfaceID
- *       (IOSurfaceLookup) and imports it into sharedTexture. A busy
- *       or crashed terminal can't stall window management, and the
- *       path stays zero-copy — frames never leave the GPU.
+ *       utilityProcess (host.js); each presented frame arrives in the
+ *       main process as a mach send-right (IOSurfaceCreateMachPort)
+ *       and is imported into sharedTexture. A busy or crashed
+ *       terminal can't stall window management, and the path stays
+ *       zero-copy — frames never leave the GPU.
  *   'main'  the engine runs in this process (the original mode; also
  *       what tests use to assert on pixels synchronously).
  */
@@ -134,25 +134,35 @@ class LocalEngine {
   }
 }
 
+let machChannelSeq = 0;
+
 /**
- * Engine in an Electron utilityProcess (host.js). Frames arrive as
- * global IOSurfaceIDs; we re-derive a local IOSurfaceRef via
- * IOSurfaceLookup (addon, no ghostty init needed) and present it.
- * State queries (size/readPixels) become async — the sync accessors
- * serve the last known size, tests use the async variants.
+ * Engine in an Electron utilityProcess (host.js). Frames cross the
+ * process boundary as mach send-rights (IOSurfaceCreateMachPort over
+ * a bootstrap channel — Electron's parentPort can't carry mach
+ * rights); each 'frame' JS message means exactly one mach message is
+ * already queued, so the receive here is immediate. State queries
+ * (size/readPixels) become async — the sync accessors serve the last
+ * known size, tests use the async variants.
  */
 class UtilityEngine {
   constructor(term, opts) {
     this._term = term;
-    this._addon = load(); // only for surfaceLookup/surfaceRelease
+    this._addon = load(); // mach channel + surfaceRelease
     this._exited = false;
     this._lastSize = null;
     this._replies = new Map(); // id -> resolve
     this._replySeq = 0;
+    const channelName =
+      `electron-ghostty.${process.pid}.${++machChannelSeq}`;
+    this._machChannel = this._addon.machChannelCreate(channelName);
     this._child = utilityProcess.fork(
       path.join(__dirname, 'host.js'),
       [],
-      { serviceName: 'electron-ghostty engine' },
+      {
+        serviceName: 'electron-ghostty engine',
+        env: { ...process.env, ELECTRON_GHOSTTY_MACH_CHANNEL: channelName },
+      },
     );
     this._child.on('message', (msg) => this._onMessage(msg));
     this._child.on('exit', () => {
@@ -177,16 +187,23 @@ class UtilityEngine {
   _onMessage(msg) {
     switch (msg.type) {
       case 'frame': {
-        const surf = this._addon.surfaceLookup(msg.surfaceId);
-        if (surf) {
+        // One-frame-in-flight: this JS message means exactly one mach
+        // message is queued on our channel. Drain any stale frames
+        // (shouldn't happen; belt-and-suspenders) and keep the newest.
+        let recv = this._addon.machChannelReceiveSurface(this._machChannel, 250);
+        while (recv && recv.seq < msg.seq) {
+          this._addon.surfaceRelease(recv.handle);
+          recv = this._addon.machChannelReceiveSurface(this._machChannel, 250);
+        }
+        if (recv) {
+          const surf = recv.handle;
           const ok = this._term._presentFrame(
             { ioSurface: surf }, msg.width, msg.height);
           const release = () => this._addon.surfaceRelease(surf);
           if (ok && typeof ok.then === 'function') ok.then(release, release);
           else release();
         }
-        // Ack regardless — a failed lookup (surface already recycled,
-        // e.g. right after a resize) must not wedge the frame flow.
+        // Ack regardless — a missed receive must not wedge the flow.
         this._child.postMessage({ type: 'frame-ack' });
         break;
       }
