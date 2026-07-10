@@ -11,10 +11,27 @@ permissions:
   actions: read
 
 jobs:
-  macos:
-    name: macOS (headless ghostty embedding, e2e + integration)
-    runs-on: macos-15
+  # macOS and Linux share the same setup/build scaffolding (checkout → node →
+  # zig → npm ci → patched libghostty → payload), the E2E test invocation, and
+  # the summary/upload tail. Only the middle differs, and it differs because
+  # the code does: the headless ghostty embedding (N-API addon + renderer-poc +
+  # Electron integration) is macOS/Metal/IOSurface-only, so those steps are
+  # gated on `runner.os == 'macOS'`. Linux proves the fork compiles and runs
+  # the DOM baselines under xvfb; its native rendering is pending EGL/GBM
+  # (see docs/ghostty-renderer-reuse.md). One matrix job with a few guards
+  # rather than two near-identical jobs.
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            name: macOS (headless ghostty embedding, e2e + integration)
+          - os: ubuntu-latest
+            name: Linux (fork compiles + DOM baselines; headless rendering pending EGL/GBM)
     steps:
       - uses: actions/checkout@v4
 
@@ -29,67 +46,39 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      # Clones ghostty, applies the fork patch, builds the full lib. On Linux
+      # this also proves the fork compiles; the native addon below is macOS-only.
       - name: Build patched libghostty (clone + fork patch + full lib)
         run: npm run setup:ghostty
 
+      # The N-API addon links libghostty's Metal renderer + IOSurface
+      # presentation; binding.gyp only has a mac branch, so build on macOS only.
       - name: Build N-API addon (ghostty embedding wrapper)
+        if: runner.os == 'macOS'
         run: npm run build:native
 
       - name: Generate payload
         run: npm run payload
 
       - name: Headless embedding PoC (pixel-asserting, no Electron)
+        if: runner.os == 'macOS'
         run: make -C native/renderer-poc test
 
+      # E2E cases self-skip on non-Darwin (the addon is macOS-only): a real
+      # suite on macOS, a green no-op on Linux that proves the harness loads.
       - name: E2E tests (spawn/input/resize/scroll, IOSurface pixels)
         run: npm test
 
       - name: "Integration tests (Electron: DOM benches + demo smoke)"
+        if: runner.os == 'macOS'
         run: npm run test:integration
 
       - name: DOM terminal flood benchmarks
+        if: runner.os == 'macOS'
         run: node bench/run.js flood --runs 3
 
-      - name: Job summary
-        if: always()
-        shell: bash
-        run: node scripts/ci-summary.js >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: results-macos
-          path: results/
-          if-no-files-found: ignore
-
-  linux:
-    name: Linux (fork compiles + DOM baselines; headless rendering pending EGL/GBM)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build patched libghostty (proves the fork compiles on Linux)
-        run: npm run setup:ghostty
-
-      - name: E2E tests (skip on non-Darwin by design)
-        run: npm test
-
-      - name: Generate payload
-        run: npm run payload
-
       - name: DOM terminal benchmarks (Electron under xvfb)
+        if: runner.os == 'Linux'
         # SwiftShader WebGL2 is blocklisted by default on GPU-less machines;
         # both flags are required for the WebGL addon to initialize.
         run: |
@@ -108,6 +97,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: results-linux
+          name: results-${{ runner.os == 'macOS' && 'macos' || 'linux' }}
           path: results/
           if-no-files-found: ignore
