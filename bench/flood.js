@@ -36,9 +36,9 @@ if (!fs.existsSync(path.join(ROOT, 'payload.txt'))) {
 }
 
 function entryArgs(backend) {
-  // Only DOM backends remain; the native producer was replaced by the
-  // headless ghostty embedding (see demo-ghostty-renderer/).
-  return [path.join(__dirname, 'flood-dom-main.js'), '--backend', backend.key];
+  return backend.kind === 'native'
+    ? [path.join(__dirname, 'flood-native-main.js')]
+    : [path.join(__dirname, 'flood-dom-main.js'), '--backend', backend.key];
 }
 
 function runOnce(backend, extraArgs) {
@@ -66,7 +66,7 @@ function printTable(title, rows) {
   const mb = baseline.result.payloadBytes / (1024 * 1024);
   const scale = rows[rows.length - 1].result.scale;
   const row = (name, r) =>
-    `  ${name.padEnd(46)} ${r.parseMs.toFixed(1).padStart(9)} ${r.e2eMs.toFixed(1).padStart(9)} ` +
+    `  ${name.padEnd(46)} ${(r.parseMs == null ? 'n/a' : r.parseMs.toFixed(1)).padStart(9)} ${r.e2eMs.toFixed(1).padStart(9)} ` +
     `${(mb / (r.e2eMs / 1000)).toFixed(1).padStart(7)} ${String(r.frames).padStart(7)}`;
 
   console.log('');
@@ -78,12 +78,20 @@ function printTable(title, rows) {
   for (const { backend, result } of rows) console.log(row(backend.name, result));
   console.log('  ' + '─'.repeat(82));
   for (const { backend, result } of rows.slice(1)) {
+    const parseRatio = (result.parseMs == null || baseline.result.parseMs == null)
+      ? 'n/a (PTY path)'
+      : `${(baseline.result.parseMs / result.parseMs).toFixed(1)}×`;
     console.log(`  ${backend.key} vs ${rows[0].backend.key} — ` +
-      `parse: ${(baseline.result.parseMs / result.parseMs).toFixed(1)}×   ` +
+      `parse: ${parseRatio}   ` +
       `e2e: ${(baseline.result.e2eMs / result.e2eMs).toFixed(1)}×`);
   }
   for (const { backend, result } of rows)
     console.log(`  e2e runs — ${backend.key}: [${result.allE2eMs.join(', ')}]`);
+  if (rows.some(({ backend }) => backend.kind === 'native')) {
+    console.log('  NOTE: ghostty rows go through a real PTY (ghostty owns the');
+    console.log('  shell) — they include pipe/kernel overhead the DOM rows,');
+    console.log('  which write() straight into the parser, do not pay.');
+  }
 }
 
 const modes = [{ title: 'BURST: cat payload once', args: [...screenshot] }];
@@ -95,6 +103,10 @@ const summary = {};
 for (const mode of modes) {
   const rows = [];
   for (const backend of BACKENDS) {
+    if (backend.platforms && !backend.platforms.includes(process.platform)) {
+      console.error(`${backend.key}: not available on ${process.platform}; skipping`);
+      continue;
+    }
     // Screenshots only apply to the native backend's pixel-equivalence check.
     const args = backend.kind === 'dom' ? mode.args.filter(a => a !== '--screenshot') : mode.args;
     try {

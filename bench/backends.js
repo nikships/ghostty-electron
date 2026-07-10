@@ -3,11 +3,16 @@
  * The terminal-backend registry — the single place a new terminal is added.
  *
  * The flood benchmark and the reporting pipeline iterate this list.
- * Currently only 'dom' backends exist: xterm.js-compatible libraries
- * rendering into the DOM of a Chromium renderer (constructed per-key
- * by bench/dom-terminal.js; write()/buffer/onData API assumed). The
- * native ghostty embedding is not yet re-integrated as a flood backend
- * (the pre-rewrite native backend last exists at commit 1a4357c).
+ *
+ *   kind 'dom'    — xterm.js-compatible library rendering into the DOM
+ *                   of a Chromium renderer (constructed per-key by
+ *                   bench/dom-terminal.js; write()/buffer/onData API).
+ *   kind 'native' — the ghostty embedding (packages/electron-ghostty)
+ *                   presenting via sharedTexture; runs through
+ *                   bench/flood-native-main.js. Its payload goes
+ *                   through a real PTY (ghostty owns the shell), so
+ *                   its numbers INCLUDE pipe overhead the DOM numbers
+ *                   don't pay — stated in every table.
  *
  * `resultKey` is the stable field name in results/*.json (the CI
  * summary reads it); `resultFile` is the per-backend flood output.
@@ -35,6 +40,15 @@ const BACKENDS = [
     name: 'ghostty-web WASM (in-renderer DOM)',
     kind: 'dom',
     syncWrite: true
+  },
+  {
+    key: 'ghostty',
+    resultKey: 'ghostty',
+    resultFile: 'ghostty.json',
+    name: 'ghostty embedded (Metal, sharedTexture, via PTY)',
+    kind: 'native',
+    // macOS only: Metal + IOSurface presentation.
+    platforms: ['darwin']
   }
 ];
 
