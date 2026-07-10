@@ -10,6 +10,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+REPO_ROOT="$(pwd -P)"
 
 if [ ! -d vendor/ghostty ]; then
   echo "vendor/ghostty missing — run npm run setup:ghostty first" >&2
@@ -18,7 +19,9 @@ fi
 
 cd vendor/ghostty
 
-for patch in ../../patches/*.patch; do
+# Absolute path: vendor/ may be a symlink (worktree setups), which
+# would make a relative ../../patches resolve somewhere else.
+for patch in "$REPO_ROOT"/patches/*.patch; do
   if git apply --check "$patch" 2>/dev/null; then
     echo "applying $(basename "$patch")"
     # CI runners have no git identity; -c supplies one for the am commit.

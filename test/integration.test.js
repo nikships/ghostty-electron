@@ -113,6 +113,14 @@ test('utility engine protocol behaviors (frames, input, resize, crash)', MAC, ()
   assert.ok(Object.keys(r).length >= 7, 'all scenarios ran');
 });
 
+test('input translation: keys, coordinates, mouse encode to exact PTY bytes', MAC, () => {
+  runElectron(['test/input-translation.main.js'], 250_000);
+  const r = readResult('input-translation.json');
+  assert.strictEqual(r.failures, 0,
+    `all probes pass: ${JSON.stringify(r.probes.filter(p => !p.ok))}`);
+  assert.ok(r.probes.length >= 60, 'full probe matrix ran (both engines)');
+});
+
 test('embedder API (title, clipboard both ways, config, cwd, focus)', MAC, () => {
   runElectron(['test/embedder-api.main.js'], 150_000);
   const r = readResult('embedder-api-tests.json');

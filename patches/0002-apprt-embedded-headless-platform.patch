@@ -1,6 +1,6 @@
-From 918d6b0d8e1c7ce0b0d6dbe8e2f5e57ee801d351 Mon Sep 17 00:00:00 2001
+From e6e481659db2ec80c5fea7640373f071f9ed9c53 Mon Sep 17 00:00:00 2001
 From: Max Schmitt <max@schmitt.mx>
-Date: Thu, 9 Jul 2026 20:49:45 -0700
+Date: Fri, 10 Jul 2026 14:20:30 -0700
 Subject: [PATCH] apprt/embedded: headless platform for offscreen embedding
  (macOS)
 
@@ -12,43 +12,19 @@ the layer directly via the new Metal.setLayerSize().
 ghostty_surface_headless_frame() returns the last presented IOSurface
 (retained +1 for the caller) with size/scale, so embedders can read
 frames or import them into their own compositor (e.g. Electron's
-sharedTexture module) without any view hierarchy.
+sharedTexture module) without any view hierarchy. Ghostty
+triple-buffers: the returned surface is reused two presents later, so
+callers must copy or import promptly (documented on the API).
 
-Also installs libghostty.a on macOS (previously only the xcframework
-path consumed the full library).
+Headless requires the Metal backend today; surface_new returns
+error.UnsupportedPlatform on non-Darwin targets instead of panicking
+at the first GL call.
 ---
- build.zig              |  8 +++-
- include/ghostty.h      | 21 ++++++++++
- src/apprt/embedded.zig | 93 ++++++++++++++++++++++++++++++++++++++++++
- src/renderer/Metal.zig | 40 ++++++++++++++----
- 4 files changed, 153 insertions(+), 9 deletions(-)
+ include/ghostty.h      | 21 +++++++++
+ src/apprt/embedded.zig | 99 ++++++++++++++++++++++++++++++++++++++++++
+ src/renderer/Metal.zig | 40 ++++++++++++++---
+ 3 files changed, 153 insertions(+), 7 deletions(-)
 
-diff --git a/build.zig b/build.zig
-index 8ef7701..929f5fd 100644
---- a/build.zig
-+++ b/build.zig
-@@ -189,8 +189,6 @@ pub fn build(b: *std.Build) !void {
-         const lib_shared = try buildpkg.GhosttyLib.initShared(b, &deps);
-         const lib_static = try buildpkg.GhosttyLib.initStatic(b, &deps);
- 
--        // We shouldn't have this guard but we don't currently
--        // build on macOS this way ironically so we need to fix that.
-         if (!config.target.result.os.tag.isDarwin()) {
-             lib_shared.installHeader(); // Only need one header
-             if (config.target.result.os.tag == .windows) {
-@@ -200,6 +198,12 @@ pub fn build(b: *std.Build) !void {
-                 lib_shared.install("ghostty-internal.so");
-                 lib_static.install("ghostty-internal.a");
-             }
-+        } else {
-+            // On macOS install the static archive directly so embedders
-+            // that aren't the Ghostty.app Xcode project (which consumes
-+            // the xcframework) can link the full library.
-+            lib_static.installHeader();
-+            lib_static.install("libghostty.a");
-         }
-     }
- 
 diff --git a/include/ghostty.h b/include/ghostty.h
 index 72bbb57..6d78d3e 100644
 --- a/include/ghostty.h
@@ -101,7 +77,7 @@ index 72bbb57..6d78d3e 100644
  GHOSTTY_API void ghostty_surface_set_focus(ghostty_surface_t, bool);
  GHOSTTY_API void ghostty_surface_set_occlusion(ghostty_surface_t, bool);
 diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
-index 7310159..14a37e2 100644
+index 7310159..2f89bba 100644
 --- a/src/apprt/embedded.zig
 +++ b/src/apprt/embedded.zig
 @@ -9,6 +9,8 @@ const builtin = @import("builtin");
@@ -147,16 +123,22 @@ index 7310159..14a37e2 100644
      };
  
      /// Initialize a Platform a tag and configuration from the C ABI.
-@@ -387,6 +402,8 @@ pub const Platform = union(PlatformTag) {
+@@ -387,6 +402,14 @@ pub const Platform = union(PlatformTag) {
                      break :ios error.UIViewMustBeSet);
                  break :ios .{ .ios = .{ .uiview = uiview } };
              } else error.UnsupportedPlatform,
 +
-+            .headless => .{ .headless = .{} },
++            // Headless currently requires the Metal renderer's
++            // IOSurfaceLayer (Darwin): reject cleanly on other targets
++            // instead of panicking at the first GL call.
++            .headless => if (comptime builtin.target.os.tag.isDarwin())
++                .{ .headless = .{} }
++            else
++                error.UnsupportedPlatform,
          };
      }
  };
-@@ -397,6 +414,7 @@ pub const PlatformTag = enum(c_int) {
+@@ -397,6 +420,7 @@ pub const PlatformTag = enum(c_int) {
  
      macos = 1,
      ios = 2,
@@ -164,7 +146,7 @@ index 7310159..14a37e2 100644
  };
  
  pub const EnvVar = extern struct {
-@@ -586,6 +604,19 @@ pub const Surface = struct {
+@@ -586,6 +610,19 @@ pub const Surface = struct {
          );
          errdefer self.core_surface.deinit();
  
@@ -184,7 +166,7 @@ index 7310159..14a37e2 100644
          // If our options requested a specific font-size, set that.
          if (opts.font_size != 0) {
              var font_size = self.core_surface.font_size;
-@@ -805,6 +836,15 @@ pub const Surface = struct {
+@@ -805,6 +842,15 @@ pub const Surface = struct {
              .height = height,
          };
  
@@ -200,7 +182,7 @@ index 7310159..14a37e2 100644
          // Call the primary callback.
          self.core_surface.sizeCallback(self.size) catch |err| {
              log.err("error in size callback err={}", .{err});
-@@ -1692,6 +1732,59 @@ pub const CAPI = struct {
+@@ -1692,6 +1738,59 @@ pub const CAPI = struct {
          surface.draw();
      }
  

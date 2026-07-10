@@ -1,0 +1,42 @@
+From cb4a04c60ec26f259653a6e6f81ca268e16d2f4f Mon Sep 17 00:00:00 2001
+From: Max Schmitt <max@schmitt.mx>
+Date: Fri, 10 Jul 2026 14:20:30 -0700
+Subject: [PATCH] build: install libghostty.a + header on macOS
+
+The static archive was only consumable through the xcframework path
+(the Ghostty.app Xcode project). Install it directly on macOS too so
+non-Xcode embedders can link the full library. Matches what already
+happens on Linux/Windows.
+---
+ build.zig | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/build.zig b/build.zig
+index 8ef7701..929f5fd 100644
+--- a/build.zig
++++ b/build.zig
+@@ -189,8 +189,6 @@ pub fn build(b: *std.Build) !void {
+         const lib_shared = try buildpkg.GhosttyLib.initShared(b, &deps);
+         const lib_static = try buildpkg.GhosttyLib.initStatic(b, &deps);
+ 
+-        // We shouldn't have this guard but we don't currently
+-        // build on macOS this way ironically so we need to fix that.
+         if (!config.target.result.os.tag.isDarwin()) {
+             lib_shared.installHeader(); // Only need one header
+             if (config.target.result.os.tag == .windows) {
+@@ -200,6 +198,12 @@ pub fn build(b: *std.Build) !void {
+                 lib_shared.install("ghostty-internal.so");
+                 lib_static.install("ghostty-internal.a");
+             }
++        } else {
++            // On macOS install the static archive directly so embedders
++            // that aren't the Ghostty.app Xcode project (which consumes
++            // the xcframework) can link the full library.
++            lib_static.installHeader();
++            lib_static.install("libghostty.a");
+         }
+     }
+ 
+-- 
+2.50.1 (Apple Git-155)
+

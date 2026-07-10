@@ -21,11 +21,13 @@ Status at evaluation time: all three approaches were implemented and
 asserted on IOSurface pixels). Windows/Linux analysis below is from
 source inspection plus runtime probes of the same fork.
 
-The fork is a single additive patch series on ghostty `c41c6b8`:
-`patches/0001-ghostty-headless-renderer-c-api.patch` (~1 100 lines
-added, 9 modified — headless platform, standalone renderer, mouse/
-scroll/resize, ghostty-owned PTY), applied by
-`scripts/apply-ghostty-patches.sh`.
+The fork is a small additive patch series on ghostty `c41c6b8`,
+applied by `scripts/apply-ghostty-patches.sh`, split upstream-shaped:
+`patches/0001-build-install-libghostty-static-on-macos.patch` (the
+build change alone) and
+`patches/0002-apprt-embedded-headless-platform.patch` (the headless
+platform + `ghostty_surface_headless_frame()`, ~300 lines; non-Darwin
+targets get error.UnsupportedPlatform instead of a GL panic).
 
 ## What the patch adds (shared by A and B)
 
