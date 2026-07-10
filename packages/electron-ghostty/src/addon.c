@@ -273,6 +273,25 @@ static napi_value Destroy(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
+/**
+ * pumpMainQueue() — drain pending main-dispatch-queue blocks.
+ *
+ * Ghostty's render thread presents frames via dispatch_async to the
+ * main queue (IOSurfaceLayer.setSurface). Electron's main process
+ * pumps the main run loop for us; a utilityProcess is plain Node with
+ * no CFRunLoop, so without this the layer contents never update after
+ * the first synchronous draw. Must be called from the process's main
+ * thread (Node's JS thread is).
+ */
+static napi_value PumpMainQueue(napi_env env, napi_callback_info info) {
+  (void)env;
+  (void)info;
+  while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true) ==
+         kCFRunLoopRunHandledSource) {
+  }
+  return NULL;
+}
+
 /** tick(h) — drain ghostty's app loop. Call on wakeup + periodically. */
 static napi_value Tick(napi_env env, napi_callback_info info) {
   size_t argc = 1;
@@ -304,7 +323,7 @@ static napi_value Draw(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
-/** frame(h) -> { handle, width, height, scale } | null */
+/** frame(h) -> { handle, surfaceId, width, height, scale } | null */
 static napi_value Frame(napi_env env, napi_callback_info info) {
   size_t argc = 1;
   napi_value argv[1];
@@ -328,6 +347,12 @@ static napi_value Frame(napi_env env, napi_callback_info info) {
   NAPI_CALL(env, napi_create_buffer_copy(env, sizeof(void *),
                                          &frame.iosurface, NULL, &handle));
   NAPI_CALL(env, napi_set_named_property(env, result, "handle", handle));
+  /* Global IOSurfaceID: another process (Electron's main process, when
+   * ghostty runs in a utilityProcess) re-derives a local IOSurfaceRef
+   * via IOSurfaceLookup. Headless targets are created IsGlobal. */
+  NAPI_CALL(env, napi_create_uint32(
+                     env, IOSurfaceGetID((IOSurfaceRef)frame.iosurface), &v));
+  NAPI_CALL(env, napi_set_named_property(env, result, "surfaceId", v));
   NAPI_CALL(env, napi_create_uint32(env, frame.width_px, &v));
   NAPI_CALL(env, napi_set_named_property(env, result, "width", v));
   NAPI_CALL(env, napi_create_uint32(env, frame.height_px, &v));
@@ -519,6 +544,53 @@ static napi_value MouseScroll(napi_env env, napi_callback_info info) {
   return NULL;
 }
 
+/**
+ * surfaceLookup(surfaceId) -> Buffer(IOSurfaceRef, +1) | null
+ * Re-derives a process-local IOSurfaceRef from a global IOSurfaceID
+ * (frames produced by ghostty running in ANOTHER process, e.g. an
+ * Electron utilityProcess). Caller must surfaceRelease() the handle
+ * when done. Pure IOSurface — needs no ghostty init.
+ */
+static napi_value SurfaceLookup(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  uint32_t id;
+  NAPI_CALL(env, napi_get_value_uint32(env, argv[0], &id));
+
+  IOSurfaceRef surf = IOSurfaceLookup((IOSurfaceID)id); /* returns +1 */
+  if (!surf) {
+    napi_value null_val;
+    NAPI_CALL(env, napi_get_null(env, &null_val));
+    return null_val;
+  }
+
+  napi_value handle;
+  NAPI_CALL(env,
+            napi_create_buffer_copy(env, sizeof(void *), &surf, NULL, &handle));
+  return handle;
+}
+
+/** surfaceRelease(handle) — CFRelease a surfaceLookup() handle. */
+static napi_value SurfaceRelease(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+
+  void *data = NULL;
+  size_t len = 0;
+  NAPI_CALL(env, napi_get_buffer_info(env, argv[0], &data, &len));
+  if (len != sizeof(void *)) {
+    napi_throw_error(env, NULL, "invalid surface handle");
+    return NULL;
+  }
+  void *surf;
+  memcpy(&surf, data, sizeof(void *));
+  if (surf) CFRelease((IOSurfaceRef)surf);
+  return NULL;
+}
+
 /** processExited(h) -> bool */
 static napi_value ProcessExited(napi_env env, napi_callback_info info) {
   size_t argc = 1;
@@ -536,6 +608,8 @@ static napi_value ProcessExited(napi_env env, napi_callback_info info) {
 static napi_value Init(napi_env env, napi_value exports) {
   napi_property_descriptor props[] = {
       {"init", NULL, InitGhostty, NULL, NULL, NULL, napi_default, NULL},
+      {"pumpMainQueue", NULL, PumpMainQueue, NULL, NULL, NULL, napi_default,
+       NULL},
       {"create", NULL, Create, NULL, NULL, NULL, napi_default, NULL},
       {"destroy", NULL, Destroy, NULL, NULL, NULL, napi_default, NULL},
       {"tick", NULL, Tick, NULL, NULL, NULL, napi_default, NULL},
@@ -552,6 +626,10 @@ static napi_value Init(napi_env env, napi_value exports) {
        NULL},
       {"mousePos", NULL, MousePos, NULL, NULL, NULL, napi_default, NULL},
       {"mouseScroll", NULL, MouseScroll, NULL, NULL, NULL, napi_default,
+       NULL},
+      {"surfaceLookup", NULL, SurfaceLookup, NULL, NULL, NULL, napi_default,
+       NULL},
+      {"surfaceRelease", NULL, SurfaceRelease, NULL, NULL, NULL, napi_default,
        NULL},
       {"processExited", NULL, ProcessExited, NULL, NULL, NULL, napi_default,
        NULL},

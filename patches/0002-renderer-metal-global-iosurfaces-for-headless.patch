@@ -1,0 +1,128 @@
+From b8a8259fc27c8a0746d392cc6e780ddd120304e0 Mon Sep 17 00:00:00 2001
+From: Max Schmitt <max@schmitt.mx>
+Date: Fri, 10 Jul 2026 02:19:15 -0700
+Subject: [PATCH] renderer/metal: global IOSurfaces for headless render targets
+
+Headless embedding may run ghostty in a different process than the
+compositor (e.g. an Electron utilityProcess feeding the main process).
+IOSurfaceRefs are process-local, so cross-process presentation needs a
+surface the other side can re-derive: create headless render targets
+with kIOSurfaceIsGlobal so IOSurfaceLookup(IOSurfaceGetID(s)) works
+from any process.
+
+Global IOSurfaces are deprecated by Apple (any task that guesses the
+ID can read the pixels), which is acceptable for this experimental
+embedding; the proper long-term channel is a mach-port handoff.
+Windowed/viewed surfaces are unchanged.
+---
+ pkg/macos/iosurface/iosurface.zig | 26 +++++++++++++++++++-------
+ src/renderer/Metal.zig            | 10 ++++++++++
+ src/renderer/metal/Target.zig     |  5 +++++
+ 3 files changed, 34 insertions(+), 7 deletions(-)
+
+diff --git a/pkg/macos/iosurface/iosurface.zig b/pkg/macos/iosurface/iosurface.zig
+index 37f8712..87036f4 100644
+--- a/pkg/macos/iosurface/iosurface.zig
++++ b/pkg/macos/iosurface/iosurface.zig
+@@ -17,6 +17,13 @@ pub const IOSurface = opaque {
+         pixel_format: video.PixelFormat,
+         bytes_per_element: c_int,
+         colorspace: ?*graphics.ColorSpace,
++
++        /// Make the surface discoverable by any process via
++        /// IOSurfaceLookup of its IOSurfaceID. Deprecated by Apple
++        /// (global surfaces are readable by any task that guesses the
++        /// ID); only for embedders that must hand frames across
++        /// process boundaries without a mach port channel.
++        is_global: bool = false,
+     };
+ 
+     pub fn init(properties: Properties) Allocator.Error!*IOSurface {
+@@ -29,14 +36,19 @@ pub const IOSurface = opaque {
+         var bpe = try foundation.Number.create(.int, &properties.bytes_per_element);
+         defer bpe.release();
+ 
++        const keys: [5]?*const anyopaque = .{
++            c.kIOSurfaceWidth,
++            c.kIOSurfaceHeight,
++            c.kIOSurfacePixelFormat,
++            c.kIOSurfaceBytesPerElement,
++            c.kIOSurfaceIsGlobal,
++        };
++        const values: [5]?*const anyopaque = .{ w, h, pf, bpe, c.kCFBooleanTrue };
++        const len: usize = if (properties.is_global) 5 else 4;
++
+         var properties_dict = try foundation.Dictionary.create(
+-            &[_]?*const anyopaque{
+-                c.kIOSurfaceWidth,
+-                c.kIOSurfaceHeight,
+-                c.kIOSurfacePixelFormat,
+-                c.kIOSurfaceBytesPerElement,
+-            },
+-            &[_]?*const anyopaque{ w, h, pf, bpe },
++            keys[0..len],
++            values[0..len],
+         );
+         defer properties_dict.release();
+ 
+diff --git a/src/renderer/Metal.zig b/src/renderer/Metal.zig
+index 72aff65..2e67849 100644
+--- a/src/renderer/Metal.zig
++++ b/src/renderer/Metal.zig
+@@ -58,6 +58,11 @@ default_storage_mode: mtl.MTLResourceOptions.StorageMode,
+ /// The maximum 2D texture width and height supported by the device.
+ max_texture_size: u32,
+ 
++/// Headless surface (no view): back render targets with global
++/// IOSurfaces so an embedder in another process can import presented
++/// frames by IOSurfaceID.
++headless: bool = false,
++
+ /// We start an AutoreleasePool before `drawFrame` and end it afterwards.
+ autorelease_pool: ?*objc.AutoreleasePool = null,
+ 
+@@ -159,6 +164,10 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) !Metal {
+         .blending = opts.config.blending,
+         .default_storage_mode = default_storage_mode,
+         .max_texture_size = max_texture_size,
++        .headless = switch (apprt.runtime) {
++            apprt.embedded => opts.rt_surface.platform == .headless,
++            else => false,
++        },
+     };
+ }
+ 
+@@ -272,6 +281,7 @@ pub fn initTarget(self: *const Metal, width: usize, height: usize) !Target {
+         .storage_mode = self.default_storage_mode,
+         .width = width,
+         .height = height,
++        .global_surface = self.headless,
+     });
+ }
+ 
+diff --git a/src/renderer/metal/Target.zig b/src/renderer/metal/Target.zig
+index f20bb0b..f8caffe 100644
+--- a/src/renderer/metal/Target.zig
++++ b/src/renderer/metal/Target.zig
+@@ -28,6 +28,10 @@ pub const Options = struct {
+     pixel_format: mtl.MTLPixelFormat,
+     /// Storage mode for the MTLTexture
+     storage_mode: mtl.MTLResourceOptions.StorageMode,
++
++    /// Back the texture with a global IOSurface so other processes can
++    /// import the presented frame by ID (headless embedding).
++    global_surface: bool = false,
+ };
+ 
+ /// The underlying IOSurface.
+@@ -57,6 +61,7 @@ pub fn init(opts: Options) !Self {
+         .pixel_format = .@"32BGRA",
+         .bytes_per_element = 4,
+         .colorspace = colorspace,
++        .is_global = opts.global_surface,
+     });
+ 
+     // Create our descriptor
+-- 
+2.50.1 (Apple Git-155)
+

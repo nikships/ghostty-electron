@@ -76,11 +76,18 @@ test('ghostty-web flood benchmark runs and reports sane numbers', () => {
   assert.ok(r.frames > 0, 'rendered frames');
 });
 
-test('ghostty headless-embedding demo renders marker (smoke)', MAC, () => {
+test('ghostty headless-embedding demo renders marker (smoke, utility-process engine)', MAC, () => {
   runElectron(['demo-ghostty-renderer/main.js', '--smoke'], 210_000);
   const r = readResult('demo-smoke.json');
   assert.ok(r.ok, 'marker rendered');
   assert.ok(r.foregroundPixels > 200, 'text pixels present');
   assert.ok(r.size.cols > 0 && r.size.rows > 0, 'grid derived from cell metrics');
   assert.ok(fs.existsSync(path.join(ROOT, 'results', 'demo-ghostty.png')), 'screenshot');
+});
+
+test('ghostty headless-embedding demo renders marker (smoke, main-process engine)', MAC, () => {
+  runElectron(['demo-ghostty-renderer/main.js', '--smoke', '--engine=main'], 210_000);
+  const r = readResult('demo-smoke.json');
+  assert.ok(r.ok, 'marker rendered');
+  assert.ok(r.foregroundPixels > 200, 'text pixels present');
 });

@@ -316,6 +316,7 @@ bench/pty-main.js|pty-dom…   PTY race / latency / soak, per-backend runners
 bench/dom-terminal.js        one factory for xterm.js-compatible libraries
 packages/electron-ghostty  the embedding as a reusable package:
   index.js                   GhosttyTerminal (present loop, input, resize)
+  host.js                    utilityProcess engine host (default placement)
   preload.js                 sandboxed renderer side (canvas paint + input)
   src/addon.c                N-API wrapper around patched libghostty
 scripts/                   payload gen, ghostty build, chart gen, CI reporting

@@ -15,6 +15,16 @@ module imports it **zero-copy** into a sandboxed `<canvas>` as a W3C
 What's left for this package is only the glue: tick ghostty's app
 loop, forward input, ship each presented frame.
 
+By default the engine doesn't even run in the Electron main process:
+`host.js` runs the whole terminal in an Electron **utilityProcess**, so
+a busy or crashed terminal can't stall window management. Frames cross
+the process boundary as global IOSurface IDs (a `uint32` over
+`parentPort`); the main process re-derives a local `IOSurfaceRef` via
+`IOSurfaceLookup` and imports it into `sharedTexture` — still zero-copy,
+the pixels never leave the GPU. Set `engine: 'main'` to run the engine
+in-process (the original mode; tests use it for synchronous pixel
+assertions).
+
 macOS-only for now (Metal + IOSurface); Linux needs an EGL/GBM
 presenter, Windows a D3D11 one — see `docs/ghostty-renderer-reuse.md`
 at the repo root.
@@ -72,17 +82,22 @@ protocol, mouse tracking modes, scrollback routing).
 | `fontSize?` | pt |
 | `command?` | run this instead of the user's shell. Ghostty execs it directly (login-shell exec), so compound commands need `sh -c '…'` |
 | `widthPx?`, `heightPx?` | initial surface size; the attached canvas takes over as soon as the renderer reports |
+| `engine?` | `'utility'` (default): ghostty runs in a utilityProcess. `'main'`: ghostty runs in the main process |
 
 Methods/events on the instance:
 
 - `attach(webContents)` — bind to a window; the present loop starts when
   the preload signals ready.
-- `resize(widthPx, heightPx)`, `size()` → `{cols, rows, widthPx,
-  heightPx, cellWidth, cellHeight}` (ghostty derives the grid).
+- `resize(widthPx, heightPx)`, `sizeAsync()` → `{cols, rows, widthPx,
+  heightPx, cellWidth, cellHeight}` (ghostty derives the grid). `size()`
+  is sync but with the utility engine serves the last known value.
 - `text(str)`, `key(event)`, `mouseButton/mousePos/mouseScroll(…)` —
   programmatic input, same encoders as the preload path.
-- `destroy()` — synchronous teardown; ghostty kills + reaps the shell.
-- events: `ready`, `exit` (child process ended), `present-error`.
+- `readPixelsAsync()` — BGRA copy of the presented frame (testing);
+  `readPixels()` is the sync variant, `engine: 'main'` only.
+- `destroy()` — teardown; ghostty kills + reaps the shell.
+- events: `ready`, `exit` (shell exited, or the engine process died),
+  `present-error`.
 
 Low-level: `require('electron-ghostty/addon')` exposes the raw N-API
 binding (`load()`, `available()`) for tests and embedders that run the
@@ -90,8 +105,10 @@ tick/present loop themselves — see `src/addon.c` for that surface.
 
 ## Building
 
-The addon links a **patched** libghostty (headless apprt platform —
-`patches/` at the repo root adds `ghostty_surface_headless_frame()`):
+The addon links a **patched** libghostty (`patches/` at the repo root):
+the headless apprt platform + `ghostty_surface_headless_frame()`, and
+global IOSurfaces for headless render targets so the utility-process
+engine's frames can be looked up from the main process:
 
 ```bash
 npm run setup:ghostty   # repo root: clone ghostty, apply patch, zig build

@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="482" viewBox="0 0 920 482">
+<rect width="920" height="482" fill="#fcfcfb"/>
+<text x="30" y="34" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="18" fill="#0b0b0b" font-weight="600" text-anchor="start">Where should the terminal engine live?</text>
+<text x="30" y="54" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#52514e" font-weight="400" text-anchor="start">Same ghostty embedding, same zero-copy sharedTexture path — engine in the Electron main process vs a utilityProcess.</text>
+<text x="30" y="69" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#52514e" font-weight="400" text-anchor="start">Median of 5 interleaved runs (dots = individual runs), Apple Silicon @2x, Electron 42.</text>
+<rect x="30" y="80" width="10" height="10" rx="2" fill="#2a78d6"/>
+<text x="45" y="89" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="400" text-anchor="start">engine in main process</text>
+<rect x="194.2" y="80" width="10" height="10" rx="2" fill="#1baf7a"/>
+<text x="209.2" y="89" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="400" text-anchor="start">engine in utilityProcess</text>
+<text x="30" y="114" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="12.5" fill="#0b0b0b" font-weight="600" text-anchor="start">Sustained flood, 100 MiB → presented</text>
+<text x="30" y="129" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="10.5" fill="#898781" font-weight="400" text-anchor="start">ms · lower is better</text>
+<line x1="156.44696539988655" y1="142" x2="156.44696539988655" y2="204" stroke="#e1e0d9" stroke-width="1"/>
+<text x="156.44696539988655" y="218" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">500</text>
+<line x1="230.8939307997731" y1="142" x2="230.8939307997731" y2="204" stroke="#e1e0d9" stroke-width="1"/>
+<text x="230.8939307997731" y="218" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">1,000</text>
+<line x1="305.34089619965965" y1="142" x2="305.34089619965965" y2="204" stroke="#e1e0d9" stroke-width="1"/>
+<text x="305.34089619965965" y="218" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">1,500</text>
+<line x1="82" y1="142" x2="82" y2="204" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M 82 146 h 243.7595008508224 a 4 4 0 0 1 4 4 v 14 a 4 4 0 0 1 -4 4 h -243.7595008508224 z" fill="#2a78d6"/>
+<circle cx="326.6327283040272" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="334.22631877481564" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="335.71525808281336" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="329.7595008508224" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="326.6327283040272" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="74" y="161" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11" fill="#52514e" font-weight="400" text-anchor="end">main</text>
+<text x="343.71525808281336" y="161" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="600" text-anchor="start">1,664 ms</text>
+<path d="M 82 182 h 246.43959160521837 a 4 4 0 0 1 4 4 v 14 a 4 4 0 0 1 -4 4 h -246.43959160521837 z" fill="#1baf7a"/>
+<circle cx="332.73737946681786" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="331.24844015882013" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="324.10153148043105" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="332.43959160521837" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="344.5" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="74" y="197" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11" fill="#52514e" font-weight="400" text-anchor="end">utility</text>
+<text x="352.5" y="197" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="600" text-anchor="start">1,682 ms</text>
+<text x="500" y="114" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="12.5" fill="#0b0b0b" font-weight="600" text-anchor="start">Main process blocked at spawn</text>
+<text x="500" y="129" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="10.5" fill="#898781" font-weight="400" text-anchor="start">ms · constructor, synchronous</text>
+<line x1="607.9476330154974" y1="142" x2="607.9476330154974" y2="204" stroke="#e1e0d9" stroke-width="1"/>
+<text x="607.9476330154974" y="218" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">10</text>
+<line x1="663.895266030995" y1="142" x2="663.895266030995" y2="204" stroke="#e1e0d9" stroke-width="1"/>
+<text x="663.895266030995" y="218" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">20</text>
+<line x1="719.8428990464924" y1="142" x2="719.8428990464924" y2="204" stroke="#e1e0d9" stroke-width="1"/>
+<text x="719.8428990464924" y="218" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">30</text>
+<line x1="775.79053206199" y1="142" x2="775.79053206199" y2="204" stroke="#e1e0d9" stroke-width="1"/>
+<text x="775.79053206199" y="218" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">40</text>
+<line x1="831.7381650774875" y1="142" x2="831.7381650774875" y2="204" stroke="#e1e0d9" stroke-width="1"/>
+<text x="831.7381650774875" y="218" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">50</text>
+<line x1="552" y1="142" x2="552" y2="204" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M 552 146 h 157.6846983223702 a 4 4 0 0 1 4 4 v 14 a 4 4 0 0 1 -4 4 h -157.6846983223702 z" fill="#2a78d6"/>
+<circle cx="814.5" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="697.4563880208125" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="701.3062845176914" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="722.864306209388" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="713.6846983223702" cy="157" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="544" y="161" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11" fill="#52514e" font-weight="400" text-anchor="end">main</text>
+<text x="822.5" y="161" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="600" text-anchor="start">29 ms</text>
+<path d="M 552 182 h 19.75792737997233 a 4 4 0 0 1 4 4 v 14 a 4 4 0 0 1 -4 4 h -19.75792737997233 z" fill="#1baf7a"/>
+<circle cx="575.1961236282839" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="579.7008424115028" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="576.2612266918164" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="573.3055579977141" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="575.7579273799723" cy="193" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="544" y="197" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11" fill="#52514e" font-weight="400" text-anchor="end">utility</text>
+<text x="587.7008424115028" y="197" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="600" text-anchor="start">4.2 ms</text>
+<text x="30" y="310" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="12.5" fill="#0b0b0b" font-weight="600" text-anchor="start">First frame presented</text>
+<text x="30" y="325" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="10.5" fill="#898781" font-weight="400" text-anchor="start">ms · terminal create → pixels</text>
+<line x1="145.5593220338983" y1="338" x2="145.5593220338983" y2="400" stroke="#e1e0d9" stroke-width="1"/>
+<text x="145.5593220338983" y="414" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">100</text>
+<line x1="209.1186440677966" y1="338" x2="209.1186440677966" y2="400" stroke="#e1e0d9" stroke-width="1"/>
+<text x="209.1186440677966" y="414" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">200</text>
+<line x1="272.6779661016949" y1="338" x2="272.6779661016949" y2="400" stroke="#e1e0d9" stroke-width="1"/>
+<text x="272.6779661016949" y="414" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">300</text>
+<line x1="336.2372881355932" y1="338" x2="336.2372881355932" y2="400" stroke="#e1e0d9" stroke-width="1"/>
+<text x="336.2372881355932" y="414" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">400</text>
+<line x1="82" y1="338" x2="82" y2="400" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M 82 342 h 174.6016949152542 a 4 4 0 0 1 4 4 v 14 a 4 4 0 0 1 -4 4 h -174.6016949152542 z" fill="#2a78d6"/>
+<circle cx="344.5" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="258.0593220338983" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="251.06779661016947" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="260.6016949152542" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="262.50847457627117" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="74" y="357" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11" fill="#52514e" font-weight="400" text-anchor="end">main</text>
+<text x="352.5" y="357" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="600" text-anchor="start">281 ms</text>
+<path d="M 82 378 h 145.99999999999997 a 4 4 0 0 1 4 4 v 14 a 4 4 0 0 1 -4 4 h -145.99999999999997 z" fill="#1baf7a"/>
+<circle cx="231.99999999999997" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="235.17796610169492" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="230.72881355932202" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="251.70338983050846" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="229.45762711864404" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="74" y="393" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11" fill="#52514e" font-weight="400" text-anchor="end">utility</text>
+<text x="259.70338983050846" y="393" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="600" text-anchor="start">236 ms</text>
+<text x="500" y="310" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="12.5" fill="#0b0b0b" font-weight="600" text-anchor="start">Main-loop lag during flood, p99</text>
+<text x="500" y="325" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="10.5" fill="#898781" font-weight="400" text-anchor="start">ms · 10 ms timer overshoot</text>
+<line x1="624.5572262298381" y1="338" x2="624.5572262298381" y2="400" stroke="#e1e0d9" stroke-width="1"/>
+<text x="624.5572262298381" y="414" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">0.5</text>
+<line x1="697.1144524596762" y1="338" x2="697.1144524596762" y2="400" stroke="#e1e0d9" stroke-width="1"/>
+<text x="697.1144524596762" y="414" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">1.0</text>
+<line x1="769.6716786895142" y1="338" x2="769.6716786895142" y2="400" stroke="#e1e0d9" stroke-width="1"/>
+<text x="769.6716786895142" y="414" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">1.5</text>
+<line x1="842.2289049193523" y1="338" x2="842.2289049193523" y2="400" stroke="#e1e0d9" stroke-width="1"/>
+<text x="842.2289049193523" y="414" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="9.5" fill="#898781" font-weight="400" text-anchor="middle">2.0</text>
+<line x1="552" y1="338" x2="552" y2="400" stroke="#c3c2b7" stroke-width="1"/>
+<path d="M 552 342 h 237.50672750601598 a 4 4 0 0 1 4 4 v 14 a 4 4 0 0 1 -4 4 h -237.50672750601598 z" fill="#2a78d6"/>
+<circle cx="765.2760168100582" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="814.5" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="793.506727506016" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="786.2025366559108" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="807.4800883622631" cy="353" r="4" fill="#2a78d6" stroke="#fcfcfb" stroke-width="2"/>
+<text x="544" y="357" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11" fill="#52514e" font-weight="400" text-anchor="end">main</text>
+<text x="822.5" y="357" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="600" text-anchor="start">1.7 ms</text>
+<path d="M 552 378 h 227.11290484859182 a 4 4 0 0 1 4 4 v 14 a 4 4 0 0 1 -4 4 h -227.11290484859182 z" fill="#1baf7a"/>
+<circle cx="783.1129048485918" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="775.5003457870096" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="792.067772595426" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="811.5795716442492" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<circle cx="782.2966360535061" cy="389" r="4" fill="#1baf7a" stroke="#fcfcfb" stroke-width="2"/>
+<text x="544" y="393" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11" fill="#52514e" font-weight="400" text-anchor="end">utility</text>
+<text x="819.5795716442492" y="393" font-family='system-ui, -apple-system, "Segoe UI", sans-serif' font-size="11.5" fill="#0b0b0b" font-weight="600" text-anchor="start">1.6 ms</text>
+</svg>

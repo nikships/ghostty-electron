@@ -18,6 +18,9 @@ const { GhosttyTerminal } = require('electron-ghostty');
 // rendered (checked in the raw IOSurface), screenshot, write a result
 // JSON, exit 0/1. Used by test/integration.test.js and CI.
 const SMOKE = process.argv.includes('--smoke');
+// --engine=main|utility: where ghostty runs (default: utility process).
+const ENGINE = (process.argv.find(a => a.startsWith('--engine=')) || '')
+  .split('=')[1] || undefined;
 
 app.whenReady().then(() => {
   const scale = screen.getPrimaryDisplay().scaleFactor;
@@ -25,6 +28,7 @@ app.whenReady().then(() => {
   const term = new GhosttyTerminal({
     scale,
     fontSize: 13,
+    ...(ENGINE ? { engine: ENGINE } : {}),
     // No command: ghostty launches the user's shell like a real window.
     // Smoke mode runs a deterministic marker instead. Note: ghostty
     // execs the command directly (login-shell exec), so compound
@@ -56,9 +60,7 @@ app.whenReady().then(() => {
     let fg = 0;
     // Wait until the marker output is visibly rendered in the IOSurface.
     while (Date.now() < deadline) {
-      term.tick();
-      term.draw();
-      const px = term.readPixels();
+      const px = await term.readPixelsAsync();
       if (px) {
         const bg = px.data.readUInt32LE(0);
         fg = 0;
@@ -81,7 +83,7 @@ app.whenReady().then(() => {
       ok,
       foregroundPixels: fg,
       elapsedMs: Date.now() - t0,
-      size: term.size(),
+      size: await term.sizeAsync(),
       electronVersion: process.versions.electron,
       platform: process.platform,
     };
