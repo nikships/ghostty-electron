@@ -93,6 +93,11 @@ window.addEventListener('DOMContentLoaded', () => {
 
   window.addEventListener('keydown', (e) => {
     if (e.metaKey) return; // Cmd shortcuts stay with the app
+    // IME composition (CJK, dead keys, emoji picker): the DOM fires
+    // keydowns with isComposing while the IME assembles text; sending
+    // those through the key encoder would type garbage. The composed
+    // result arrives via the 'compositionend'/'input' path below.
+    if (e.isComposing || e.keyCode === 229) return;
     const slot = focusedSlot();
     if (slot === null) return;
     const keycode = MAC_KEYCODE[e.code];
@@ -112,6 +117,7 @@ window.addEventListener('DOMContentLoaded', () => {
   });
 
   window.addEventListener('keyup', (e) => {
+    if (e.isComposing || e.keyCode === 229) return;
     const slot = focusedSlot();
     if (slot === null) return;
     const keycode = MAC_KEYCODE[e.code];
@@ -124,6 +130,26 @@ window.addEventListener('DOMContentLoaded', () => {
     if (slot === null) return;
     const text = e.clipboardData.getData('text');
     if (text) send('text', slot, { text });
+  });
+
+  // IME: composed text (CJK conversion commit, dead-key accents,
+  // emoji picker) goes through the cooked-text path — the same one
+  // paste uses — once composition finishes.
+  window.addEventListener('compositionend', (e) => {
+    const slot = focusedSlot();
+    if (slot === null) return;
+    if (e.data) send('text', slot, { text: e.data });
+  });
+
+  // Window focus/blur -> ghostty focus reporting (DECSET 1004) and
+  // unfocused-cursor rendering.
+  window.addEventListener('focus', () => {
+    const slot = focusedSlot();
+    if (slot !== null) send('focus', slot, { focused: true });
+  });
+  window.addEventListener('blur', () => {
+    const slot = focusedSlot();
+    if (slot !== null) send('focus', slot, { focused: false });
   });
 
   for (const [slot, canvas] of canvases) {

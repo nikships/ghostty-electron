@@ -87,23 +87,40 @@ protocol, mouse tracking modes, scrollback routing).
 | `scale` | devicePixelRatio of the target display (default 2) |
 | `fontSize?` | pt |
 | `command?` | run this instead of the user's shell. Ghostty execs it directly (login-shell exec), so compound commands need `sh -c '…'` |
+| `cwd?` | working directory for the shell |
+| `config?` | ghostty config-file syntax, e.g. `"background = #282c34\nscrollback-limit = 10000000"` — any ghostty option |
 | `widthPx?`, `heightPx?` | initial surface size; the attached canvas takes over as soon as the renderer reports |
 | `engine?` | `'utility'` (default): ghostty runs in a utilityProcess. `'main'`: ghostty runs in the main process |
 
 Methods/events on the instance:
 
-- `attach(webContents)` — bind to a window; the present loop starts when
-  the preload signals ready.
+- `attach(webContents, { slot } = {})` — bind to a window; the present
+  loop starts when the preload signals ready. `slot` selects a
+  `<canvas data-ghostty="name">` for multi-terminal pages.
 - `resize(widthPx, heightPx)`, `sizeAsync()` → `{cols, rows, widthPx,
   heightPx, cellWidth, cellHeight}` (ghostty derives the grid). `size()`
   is sync but with the utility engine serves the last known value.
-- `text(str)`, `key(event)`, `mouseButton/mousePos/mouseScroll(…)` —
-  programmatic input, same encoders as the preload path.
+- `text(str)`, `key(event)`, `mouseButton/mousePos/mouseScroll(…)`,
+  `setFocus(bool)` — programmatic input, same encoders as the preload
+  path.
 - `readPixelsAsync()` — BGRA copy of the presented frame (testing);
   `readPixels()` is the sync variant, `engine: 'main'` only.
 - `destroy()` — teardown; ghostty kills + reaps the shell.
-- events: `ready`, `exit` (shell exited, or the engine process died),
-  `present-error`.
+- events:
+  - `ready`, `exit` (shell exited, or the engine process died),
+    `present-error`
+  - `title` (OSC 0/2), `pwd` (OSC 7), `bell`, `open-url`,
+    `mouse-shape` (CSS cursor name)
+  - `clipboard-write` — text ghostty copied (selection copy, OSC 52);
+    already written to Electron's clipboard when emitted. Paste
+    requests are answered from Electron's clipboard automatically.
+
+Clipboard works out of the box: copy (including OSC 52 with
+`config: 'clipboard-write = allow'`) lands in the system clipboard;
+ghostty's paste binding (Cmd+V) reads from it, with bracketed-paste
+encoding handled by ghostty. IME composition (CJK, dead keys) commits
+through the cooked-text path; composing keystrokes are not
+double-sent.
 
 Low-level: `require('electron-ghostty/addon')` exposes the raw N-API
 binding (`load()`, `available()`) for tests and embedders that run the
@@ -111,10 +128,8 @@ tick/present loop themselves — see `src/addon.c` for that surface.
 
 ## Building
 
-The addon links a **patched** libghostty (`patches/` at the repo root):
-the headless apprt platform + `ghostty_surface_headless_frame()`, and
-global IOSurfaces for headless render targets so the utility-process
-engine's frames can be looked up from the main process:
+The addon links a **patched** libghostty (`patches/0001` at the repo
+root): the headless apprt platform + `ghostty_surface_headless_frame()`:
 
 ```bash
 npm run setup:ghostty   # repo root: clone ghostty, apply patch, zig build

@@ -112,3 +112,12 @@ test('utility engine protocol behaviors (frames, input, resize, crash)', MAC, ()
   }
   assert.ok(Object.keys(r).length >= 7, 'all scenarios ran');
 });
+
+test('embedder API (title, clipboard both ways, config, cwd, focus)', MAC, () => {
+  runElectron(['test/embedder-api.main.js'], 150_000);
+  const r = readResult('embedder-api-tests.json');
+  for (const [name, res] of Object.entries(r)) {
+    assert.ok(res.ok, `${name}: ${res.error ?? 'ok'}`);
+  }
+  assert.ok(Object.keys(r).length >= 6, 'all scenarios ran');
+});

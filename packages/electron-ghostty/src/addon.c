@@ -51,13 +51,60 @@
     }                                                                      \
   } while (0)
 
-/* ── ghostty runtime callbacks ─────────────────────────────────────────
- * The embedder is "the runtime": ghostty calls these. We keep them
- * minimal — wakeup sets a flag JS polls, everything else is a no-op
- * (clipboard integration can come later via Electron's clipboard). */
+/* ── ghostty runtime callbacks + event queue ───────────────────────────
+ * The embedder is "the runtime": ghostty calls these — from its render
+ * and IO threads, not the JS thread. Events are queued under a mutex
+ * and drained by JS via drainEvents() on the existing present tick, so
+ * no threadsafe-function machinery is needed and both engine
+ * placements behave identically. */
+
+#include <pthread.h>
+
+typedef enum {
+  EV_TITLE,           /* str = title */
+  EV_PWD,             /* str = path */
+  EV_BELL,            /* - */
+  EV_OPEN_URL,        /* str = url */
+  EV_MOUSE_SHAPE,     /* num = ghostty_action_mouse_shape_e */
+  EV_CLIPBOARD_WRITE, /* str = text; num = ghostty_clipboard_e */
+  EV_CLIPBOARD_READ,  /* ptr = request state for completeClipboard() */
+} EventType;
+
+typedef struct Event {
+  EventType type;
+  char *str;    /* owned (strdup), freed on drain */
+  double num;
+  void *ptr;
+  struct Event *next;
+} Event;
 
 static bool g_inited = false;
 static volatile bool g_wakeup = false;
+
+typedef struct {
+  ghostty_app_t app;      /* one app per session keeps lifecycle simple */
+  ghostty_config_t config;
+  ghostty_surface_t surface;
+  void *last_surface;     /* previous frame's IOSurfaceRef */
+  pthread_mutex_t ev_mu;
+  Event *ev_head, *ev_tail;
+} Session;
+
+static void session_push_event(Session *s, EventType type, const char *str,
+                               size_t str_len, double num, void *ptr) {
+  Event *ev = calloc(1, sizeof(Event));
+  if (!ev) return;
+  ev->type = type;
+  if (str) ev->str = str_len ? strndup(str, str_len) : strdup(str);
+  ev->num = num;
+  ev->ptr = ptr;
+  pthread_mutex_lock(&s->ev_mu);
+  if (s->ev_tail) s->ev_tail->next = ev;
+  else s->ev_head = ev;
+  s->ev_tail = ev;
+  pthread_mutex_unlock(&s->ev_mu);
+  g_wakeup = true;
+}
 
 static void cb_wakeup(void *ud) {
   (void)ud;
@@ -66,18 +113,46 @@ static void cb_wakeup(void *ud) {
 
 static bool cb_action(ghostty_app_t app, ghostty_target_s target,
                       ghostty_action_s action) {
-  (void)app;
   (void)target;
-  (void)action;
-  return false; /* unhandled; ghostty proceeds with defaults */
+  Session *s = ghostty_app_userdata(app);
+  if (!s) return false;
+  switch (action.tag) {
+    case GHOSTTY_ACTION_SET_TITLE:
+      session_push_event(s, EV_TITLE, action.action.set_title.title, 0, 0,
+                         NULL);
+      return true;
+    case GHOSTTY_ACTION_PWD:
+      session_push_event(s, EV_PWD, action.action.pwd.pwd, 0, 0, NULL);
+      return true;
+    case GHOSTTY_ACTION_RING_BELL:
+      session_push_event(s, EV_BELL, NULL, 0, 0, NULL);
+      return true;
+    case GHOSTTY_ACTION_OPEN_URL:
+      session_push_event(s, EV_OPEN_URL, action.action.open_url.url,
+                         action.action.open_url.len, 0, NULL);
+      return true;
+    case GHOSTTY_ACTION_MOUSE_SHAPE:
+      session_push_event(s, EV_MOUSE_SHAPE, NULL, 0,
+                         (double)action.action.mouse_shape, NULL);
+      return true;
+    default:
+      return false; /* unhandled; ghostty proceeds with defaults */
+  }
 }
 
+/**
+ * Paste request: ghostty wants the clipboard's contents. The state
+ * pointer stays valid until ghostty_surface_complete_clipboard_request
+ * is called (JS drains the event, reads Electron's clipboard, calls
+ * completeClipboard). Returning true = "request started".
+ */
 static bool cb_read_clipboard(void *ud, ghostty_clipboard_e loc,
                               void *state) {
-  (void)ud;
+  Session *s = ud;
   (void)loc;
-  (void)state;
-  return false;
+  if (!s) return false;
+  session_push_event(s, EV_CLIPBOARD_READ, NULL, 0, 0, state);
+  return true;
 }
 
 static void cb_confirm_read_clipboard(void *ud, const char *str, void *state,
@@ -88,14 +163,21 @@ static void cb_confirm_read_clipboard(void *ud, const char *str, void *state,
   (void)req;
 }
 
+/** Copy (selection copy, OSC 52): ship the text to JS. */
 static void cb_write_clipboard(void *ud, ghostty_clipboard_e loc,
                                const ghostty_clipboard_content_s *content,
                                size_t len, bool confirm) {
-  (void)ud;
-  (void)loc;
-  (void)content;
-  (void)len;
+  Session *s = ud;
   (void)confirm;
+  if (!s) return;
+  /* Take the first text/plain-ish entry (ghostty sends mime pairs). */
+  for (size_t i = 0; i < len; i++) {
+    if (content[i].data) {
+      session_push_event(s, EV_CLIPBOARD_WRITE, content[i].data, 0,
+                         (double)loc, NULL);
+      return;
+    }
+  }
 }
 
 static void cb_close_surface(void *ud, bool alive) {
@@ -103,14 +185,16 @@ static void cb_close_surface(void *ud, bool alive) {
   (void)alive;
 }
 
-typedef struct {
-  ghostty_app_t app;      /* one app per session keeps lifecycle simple */
-  ghostty_config_t config;
-  ghostty_surface_t surface;
-  void *last_surface;     /* previous frame's IOSurfaceRef */
-} Session;
-
 static void session_dispose(Session *s) {
+  pthread_mutex_lock(&s->ev_mu);
+  for (Event *ev = s->ev_head; ev;) {
+    Event *next = ev->next;
+    free(ev->str);
+    free(ev);
+    ev = next;
+  }
+  s->ev_head = s->ev_tail = NULL;
+  pthread_mutex_unlock(&s->ev_mu);
   if (s->last_surface) {
     CFRelease(s->last_surface);
     s->last_surface = NULL;
@@ -216,12 +300,34 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   char command[4096] = {0};
   bool has_command = get_str(env, argv[0], "command", command,
                              sizeof(command));
+  char cwd[4096] = {0};
+  bool has_cwd = get_str(env, argv[0], "cwd", cwd, sizeof(cwd));
+
+  Session *s = calloc(1, sizeof(Session));
+  pthread_mutex_init(&s->ev_mu, NULL);
 
   ghostty_config_t config = ghostty_config_new();
-  /* Self-contained: defaults only, no user config files. */
+  /* Self-contained by default (no user config files), but accept an
+   * opts.config string of ghostty config-file syntax ("background =
+   * #282c34\npalette = 0=#000000\nscrollback-limit = ...") written to
+   * a temp file — the C API only exposes file loading. This is the
+   * generic passthrough: any ghostty option works. */
+  char config_text[16384] = {0};
+  if (get_str(env, argv[0], "config", config_text, sizeof(config_text)) &&
+      config_text[0]) {
+    char tmpl[] = "/tmp/electron-ghostty-cfg-XXXXXX";
+    int fd = mkstemp(tmpl);
+    if (fd >= 0) {
+      write(fd, config_text, strlen(config_text));
+      close(fd);
+      ghostty_config_load_file(config, tmpl);
+      unlink(tmpl);
+    }
+  }
   ghostty_config_finalize(config);
 
   ghostty_runtime_config_s runtime = {0};
+  runtime.userdata = s;
   runtime.wakeup_cb = cb_wakeup;
   runtime.action_cb = cb_action;
   runtime.read_clipboard_cb = cb_read_clipboard;
@@ -232,6 +338,7 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   ghostty_app_t app = ghostty_app_new(&runtime, config);
   if (!app) {
     ghostty_config_free(config);
+    free(s);
     napi_throw_error(env, NULL, "ghostty_app_new failed");
     return NULL;
   }
@@ -239,14 +346,17 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   ghostty_surface_config_s surface_config = ghostty_surface_config_new();
   surface_config.platform_tag = GHOSTTY_PLATFORM_HEADLESS;
   surface_config.platform.headless.reserved = NULL;
+  surface_config.userdata = s;
   surface_config.scale_factor = scale;
   if (font_size > 0) surface_config.font_size = (float)font_size;
   if (has_command && command[0]) surface_config.command = command;
+  if (has_cwd && cwd[0]) surface_config.working_directory = cwd;
 
   ghostty_surface_t surface = ghostty_surface_new(app, &surface_config);
   if (!surface) {
     ghostty_app_free(app);
     ghostty_config_free(config);
+    free(s);
     napi_throw_error(env, NULL, "ghostty_surface_new failed");
     return NULL;
   }
@@ -255,7 +365,6 @@ static napi_value Create(napi_env env, napi_callback_info info) {
   ghostty_surface_set_size(surface, width_px, height_px);
   ghostty_surface_set_focus(surface, true);
 
-  Session *s = calloc(1, sizeof(Session));
   s->app = app;
   s->config = config;
   s->surface = surface;
@@ -293,6 +402,99 @@ static napi_value PumpMainQueue(napi_env env, napi_callback_info info) {
   while (CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0, true) ==
          kCFRunLoopRunHandledSource) {
   }
+  return NULL;
+}
+
+/**
+ * drainEvents(h) -> [{type, str?, num?, state?}] — events queued by
+ * ghostty's callbacks (title/pwd/bell/open-url/mouse-shape/clipboard)
+ * since the last drain. Call on the present tick. Clipboard-read
+ * events carry an opaque `state` Buffer to pass to completeClipboard.
+ */
+static napi_value DrainEvents(napi_env env, napi_callback_info info) {
+  size_t argc = 1;
+  napi_value argv[1];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s) return NULL;
+
+  pthread_mutex_lock(&s->ev_mu);
+  Event *head = s->ev_head;
+  s->ev_head = s->ev_tail = NULL;
+  pthread_mutex_unlock(&s->ev_mu);
+
+  static const char *type_names[] = {
+      "title", "pwd", "bell", "open-url", "mouse-shape",
+      "clipboard-write", "clipboard-read",
+  };
+
+  napi_value arr;
+  NAPI_CALL(env, napi_create_array(env, &arr));
+  uint32_t i = 0;
+  for (Event *ev = head; ev;) {
+    napi_value obj, v;
+    napi_create_object(env, &obj);
+    napi_create_string_utf8(env, type_names[ev->type], NAPI_AUTO_LENGTH, &v);
+    napi_set_named_property(env, obj, "type", v);
+    if (ev->str) {
+      napi_create_string_utf8(env, ev->str, NAPI_AUTO_LENGTH, &v);
+      napi_set_named_property(env, obj, "str", v);
+    }
+    napi_create_double(env, ev->num, &v);
+    napi_set_named_property(env, obj, "num", v);
+    if (ev->ptr) {
+      napi_create_buffer_copy(env, sizeof(void *), &ev->ptr, NULL, &v);
+      napi_set_named_property(env, obj, "state", v);
+    }
+    napi_set_element(env, arr, i++, obj);
+    Event *next = ev->next;
+    free(ev->str);
+    free(ev);
+    ev = next;
+  }
+  return arr;
+}
+
+/**
+ * completeClipboard(h, stateBuffer, text) — answer a clipboard-read
+ * event: hand ghostty the clipboard text (it encodes/brackets the
+ * paste itself and frees the request state).
+ */
+static napi_value CompleteClipboard(napi_env env, napi_callback_info info) {
+  size_t argc = 3;
+  napi_value argv[3];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+
+  void *buf = NULL;
+  size_t len = 0;
+  NAPI_CALL(env, napi_get_buffer_info(env, argv[1], &buf, &len));
+  if (len != sizeof(void *)) {
+    napi_throw_error(env, NULL, "invalid clipboard state");
+    return NULL;
+  }
+  void *state;
+  memcpy(&state, buf, sizeof(void *));
+
+  char text[65536];
+  size_t n;
+  NAPI_CALL(env,
+            napi_get_value_string_utf8(env, argv[2], text, sizeof(text), &n));
+  ghostty_surface_complete_clipboard_request(s->surface, text, state, false);
+  return NULL;
+}
+
+/** setFocus(h, focused) — window focus/blur (DECSET 1004 etc). */
+static napi_value SetFocus(napi_env env, napi_callback_info info) {
+  size_t argc = 2;
+  napi_value argv[2];
+  NAPI_CALL(env, napi_get_cb_info(env, info, &argc, argv, NULL, NULL));
+  Session *s = get_session(env, argv[0]);
+  if (!s || !s->surface) return NULL;
+  bool focused = true;
+  napi_get_value_bool(env, argv[1], &focused);
+  ghostty_surface_set_focus(s->surface, focused);
   return NULL;
 }
 
@@ -825,6 +1027,11 @@ static napi_value Init(napi_env env, napi_value exports) {
       {"wakeupPending", NULL, WakeupPending, NULL, NULL, NULL, napi_default,
        NULL},
       {"draw", NULL, Draw, NULL, NULL, NULL, napi_default, NULL},
+      {"drainEvents", NULL, DrainEvents, NULL, NULL, NULL, napi_default,
+       NULL},
+      {"completeClipboard", NULL, CompleteClipboard, NULL, NULL, NULL,
+       napi_default, NULL},
+      {"setFocus", NULL, SetFocus, NULL, NULL, NULL, napi_default, NULL},
       {"frame", NULL, Frame, NULL, NULL, NULL, napi_default, NULL},
       {"readPixels", NULL, ReadPixels, NULL, NULL, NULL, napi_default, NULL},
       {"size", NULL, GetSize, NULL, NULL, NULL, napi_default, NULL},

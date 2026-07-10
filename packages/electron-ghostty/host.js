@@ -59,6 +59,10 @@ function presentTick() {
   // queue; plain Node has no run loop, so pump it or frames never land.
   addon.pumpMainQueue();
   addon.tick(session);
+  // Ghostty-side events (title/pwd/bell/open-url/mouse-shape/clipboard)
+  // queued by the runtime callbacks since the last tick.
+  for (const event of addon.drainEvents(session))
+    post({ type: 'event', event });
   if (addon.processExited(session)) {
     if (!exited) {
       exited = true;
@@ -105,6 +109,9 @@ const handlers = {
   // defined once, not hand-synced between driver and host.
   op({ method, args }) {
     checkOp(method, args);
+    // Structured clone turns Buffers into Uint8Arrays; the clipboard
+    // state token must return to the addon as a Buffer.
+    if (method === 'completeClipboard') args[0] = Buffer.from(args[0]);
     addon[method](session, ...args);
   },
   'read-pixels'({ id }) {
