@@ -3,10 +3,13 @@
   "version": "0.1.0",
   "private": true,
   "description": "Ghostty embedded headlessly in Electron: ghostty owns PTY, parsing, fonts, Metal rendering \u2014 frames enter the DOM zero-copy via sharedTexture. Plus DOM-terminal benchmarks (xterm.js, ghostty-web).",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
     "payload": "node scripts/gen-payload.js",
     "setup:ghostty": "bash scripts/setup-ghostty.sh",
-    "build:native": "cd native/ghostty-renderer && node-gyp rebuild",
+    "build:native": "cd packages/electron-ghostty && node-gyp rebuild",
     "bench": "node bench/run.js flood",
     "demo": "electron demo-ghostty-renderer/main.js",
     "test": "node --test test/embedded.test.js",

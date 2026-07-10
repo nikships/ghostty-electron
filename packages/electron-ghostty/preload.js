@@ -1,17 +1,25 @@
 'use strict';
 /**
- * Sandboxed consumer for the approach-A demo: paints ghostty-rendered
- * shared textures into the canvas and forwards raw input events to the
- * main process, where ghostty's own encoders (kitty keyboard protocol,
- * mouse tracking modes, scrollback routing) handle them.
+ * electron-ghostty renderer side, sandbox-compatible. Use directly as
+ * a BrowserWindow preload, or require it from your own preload.
+ *
+ * Finds the page's `<canvas data-ghostty>` (fallback: first <canvas>),
+ * paints ghostty-rendered shared textures into it, reports its CSS size
+ * (initial + ResizeObserver) so ghostty can reflow, and forwards raw
+ * input events to the main process, where ghostty's own encoders
+ * (kitty keyboard protocol, mouse tracking modes, scrollback routing)
+ * handle them.
  */
 const { sharedTexture, ipcRenderer } = require('electron');
+
+const CH = (name) => `electron-ghostty:${name}`;
+
+let canvas = null;
 
 sharedTexture.setSharedTextureReceiver(async (data) => {
   const { importedSharedTexture: imported } = data;
   try {
     const frame = imported.getVideoFrame();
-    const canvas = document.getElementById('terminal-canvas');
     if (canvas) {
       if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
         canvas.width = frame.displayWidth;
@@ -23,13 +31,6 @@ sharedTexture.setSharedTextureReceiver(async (data) => {
   } finally {
     imported.release();
   }
-});
-
-ipcRenderer.on('init', (event, { cssWidth, cssHeight }) => {
-  const canvas = document.getElementById('terminal-canvas');
-  canvas.style.width = cssWidth + 'px';
-  canvas.style.height = cssHeight + 'px';
-  canvas.focus();
 });
 
 /* DOM KeyboardEvent.code -> macOS virtual keycode. Ghostty's embedded
@@ -57,14 +58,17 @@ function domMods(e) {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  const canvas = document.getElementById('terminal-canvas');
+  canvas = document.querySelector('canvas[data-ghostty]') ||
+           document.querySelector('canvas');
+  if (!canvas) return;
+  canvas.focus();
 
   window.addEventListener('keydown', (e) => {
     if (e.metaKey) return; // Cmd shortcuts stay with the app
     const keycode = MAC_KEYCODE[e.code];
     if (keycode === undefined && e.key.length !== 1) return;
     e.preventDefault();
-    ipcRenderer.send('key', {
+    ipcRenderer.send(CH('key'), {
       action: 1, // press
       keycode: keycode ?? 0,
       mods: domMods(e),
@@ -78,12 +82,12 @@ window.addEventListener('DOMContentLoaded', () => {
   window.addEventListener('keyup', (e) => {
     const keycode = MAC_KEYCODE[e.code];
     if (keycode === undefined) return;
-    ipcRenderer.send('key', { action: 0, keycode, mods: domMods(e) });
+    ipcRenderer.send(CH('key'), { action: 0, keycode, mods: domMods(e) });
   });
 
   window.addEventListener('paste', (e) => {
     const text = e.clipboardData.getData('text');
-    if (text) ipcRenderer.send('text', text);
+    if (text) ipcRenderer.send(CH('text'), text);
   });
 
   const rel = (e) => {
@@ -95,26 +99,37 @@ window.addEventListener('DOMContentLoaded', () => {
     e.preventDefault();
     const p = rel(e);
     // Ghostty expects scroll deltas with up = positive.
-    ipcRenderer.send('mouse-scroll', { ...p, dx: -e.deltaX, dy: -e.deltaY });
+    ipcRenderer.send(CH('mouse-scroll'), { ...p, dx: -e.deltaX, dy: -e.deltaY });
   }, { passive: false });
 
   // DOM button -> ghostty_input_mouse_button_e (1=left 2=right 3=middle)
   const GHOSTTY_BUTTON = [1, 3, 2, 4, 5];
   canvas.addEventListener('mousedown', (e) => {
-    ipcRenderer.send('mouse-button', {
+    ipcRenderer.send(CH('mouse-button'), {
       action: 1, button: GHOSTTY_BUTTON[e.button] ?? 0, mods: domMods(e),
     });
   });
   canvas.addEventListener('mouseup', (e) => {
-    ipcRenderer.send('mouse-button', {
+    ipcRenderer.send(CH('mouse-button'), {
       action: 0, button: GHOSTTY_BUTTON[e.button] ?? 0, mods: domMods(e),
     });
   });
   canvas.addEventListener('mousemove', (e) => {
-    ipcRenderer.send('mouse-pos', { ...rel(e), mods: domMods(e) });
+    ipcRenderer.send(CH('mouse-pos'), { ...rel(e), mods: domMods(e) });
   });
 
+  // The canvas element drives the surface size: report CSS size changes
+  // and ghostty reflows the grid + resizes the PTY. The bitmap size is
+  // set by the receiver above from each presented frame.
+  const reportSize = () => {
+    const r = canvas.getBoundingClientRect();
+    if (r.width > 0 && r.height > 0)
+      ipcRenderer.send(CH('resize'), { cssWidth: r.width, cssHeight: r.height });
+  };
+  new ResizeObserver(reportSize).observe(canvas);
+
   requestAnimationFrame(() => requestAnimationFrame(() => {
-    ipcRenderer.send('renderer-ready');
+    reportSize();
+    ipcRenderer.send(CH('ready'));
   }));
 });

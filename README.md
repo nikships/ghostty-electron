@@ -278,8 +278,9 @@ the portable subset plus xterm baseline on Windows.
 
 CI also runs the input-latency probe, a 2-minute soak, the render-stress
 benchmark, and compares every metric against the previous main run in the
-job summary (drift >20% gets flagged). See `docs/npm-package-plan.md` for
-the plan to extract all of this into a reusable `electron-ghostty` package.
+job summary (drift >20% gets flagged). The embedding itself lives in
+`packages/electron-ghostty` — a reusable (not yet published) package; the
+demo and tests consume it like a dependency.
 
 ## Run it
 
@@ -313,11 +314,12 @@ bench/parse.js               parser-only suite (plain node, every OS)
 bench/flood*.js|.html        in-terminal flood (DOM backends + native)
 bench/pty-main.js|pty-dom…   PTY race / latency / soak, per-backend runners
 bench/dom-terminal.js        one factory for xterm.js-compatible libraries
-native/src/vt.c            platform-independent libghostty-vt session (all OSes)
-native/src/producer_mac.m  macOS: CoreText → IOSurface presentation layer
-native/src/producer_stub.c non-mac: VT-only until a platform producer exists
+packages/electron-ghostty  the embedding as a reusable package:
+  index.js                   GhosttyTerminal (present loop, input, resize)
+  preload.js                 sandboxed renderer side (canvas paint + input)
+  src/addon.c                N-API wrapper around patched libghostty
 scripts/                   payload gen, ghostty build, chart gen, CI reporting
-demo/                      side-by-side interactive shells (node-pty)
+demo-ghostty-renderer/     live interactive shell using the package
 test/                      addon, conformance, fuzz, integration suites
 ```
 

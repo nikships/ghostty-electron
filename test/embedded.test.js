@@ -12,12 +12,10 @@ const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
 
-const ADDON_PATH = path.join(
-  __dirname, '..', 'native', 'ghostty-renderer', 'build', 'Release',
-  'ghostty_renderer.node');
+const ghostty = require('electron-ghostty/addon');
 
-const available = process.platform === 'darwin' && fs.existsSync(ADDON_PATH);
-const addon = available ? require(ADDON_PATH) : null;
+const available = ghostty.available();
+const addon = available ? ghostty.load() : null;
 if (available) addon.init();
 
 const sessions = [];
