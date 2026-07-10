@@ -24,10 +24,14 @@ const path = require('path');
 
 const ROOT = path.join(__dirname, '..');
 const RESULT = path.join(ROOT, 'results', 'engine-placement.json');
-const REPEAT = 100; // 100 x 1 MiB payload — a few seconds of sustained flood
-const RUNS = 5;
-
 const argv = process.argv;
+const intFlag = (name, fallback) => {
+  const i = argv.indexOf(name);
+  return i !== -1 ? parseInt(argv[i + 1], 10) : fallback;
+};
+const REPEAT = intFlag('--repeat', 100); // N x 1 MiB payload
+const RUNS = intFlag('--runs', 5);
+
 const engineArg = argv.includes('--engine')
   ? argv[argv.indexOf('--engine') + 1]
   : null;
@@ -41,7 +45,7 @@ if (!engineArg) {
   for (let i = 0; i < RUNS; i++) {
     for (const engine of ['main', 'utility']) {
       process.stdout.write(`run ${i + 1}/${RUNS} engine=${engine}\n`);
-      execFileSync(electron, [__filename, '--engine', engine], {
+      execFileSync(electron, [__filename, '--engine', engine, '--repeat', String(REPEAT)], {
         stdio: ['ignore', 'inherit', 'inherit'],
         timeout: 300_000,
       });
@@ -64,7 +68,7 @@ function summarize(all) {
   for (const engine of ['main', 'utility']) {
     const rs = all[engine];
     console.log(`\n=== engine: ${engine} (${rs.length} runs) ===`);
-    console.log(`flood 100 MiB e2e  median ${med(rs.map(r => r.floodMs)).toFixed(0)} ms  [${rs.map(r => r.floodMs.toFixed(0)).join(', ')}]`);
+    console.log(`flood ${REPEAT} MiB e2e  median ${med(rs.map(r => r.floodMs)).toFixed(0)} ms  [${rs.map(r => r.floodMs.toFixed(0)).join(', ')}]`);
     console.log(`create block       median ${med(rs.map(r => r.createBlockMs)).toFixed(1)} ms  [${rs.map(r => r.createBlockMs.toFixed(0)).join(', ')}]`);
     console.log(`first frame        median ${med(rs.map(r => r.firstFrameMs)).toFixed(0)} ms  [${rs.map(r => r.firstFrameMs.toFixed(0)).join(', ')}]`);
     console.log(`main-loop lag p50  median ${med(rs.map(r => r.lag.p50)).toFixed(1)} ms`);

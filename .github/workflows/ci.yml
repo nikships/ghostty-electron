@@ -77,6 +77,15 @@ jobs:
         if: runner.os == 'macOS'
         run: node bench/run.js flood --runs 3
 
+      # 1-run smoke of the engine-placement benchmark: keeps the bench
+      # and its chart pipeline from silently rotting. Not a measurement
+      # (CI runners are noisy) — just "both engines complete a run".
+      - name: Engine-placement benchmark (smoke, 1 run each)
+        if: runner.os == 'macOS'
+        run: |
+          node bench/engine-placement.js --runs 1 --repeat 10
+          node scripts/engine-placement-chart.js
+
       - name: DOM terminal benchmarks (Electron under xvfb)
         if: runner.os == 'Linux'
         # SwiftShader WebGL2 is blocklisted by default on GPU-less machines;

@@ -52,6 +52,8 @@ app.whenReady().then(() => {
   term.attach(win.webContents);
   term.on('exit', () => app.quit());
   term.on('present-error', (err) => console.error('present failed:', err.message));
+  let framesPresented = 0;
+  term.on('frame', () => framesPresented++);
   if (SMOKE) term.once('ready', runSmoke);
 
   async function runSmoke() {
@@ -71,19 +73,30 @@ app.whenReady().then(() => {
       await new Promise(r => setTimeout(r, 50));
     }
     // Let a frame reach the compositor, then screenshot the window.
+    // The screenshot is the renderer's composited output — the pixel
+    // count below proves the frame→sharedTexture→canvas path actually
+    // painted, not just that ghostty rendered into its IOSurface.
     await new Promise(r => setTimeout(r, 300));
     const resultsDir = path.join(__dirname, '..', 'results');
     fs.mkdirSync(resultsDir, { recursive: true });
+    let rendererFg = 0;
     try {
       const img = await win.webContents.capturePage();
       fs.writeFileSync(path.join(resultsDir, 'demo-ghostty.png'), img.toPNG());
+      const bmp = img.toBitmap(); // BGRA
+      const rbg = bmp.readUInt32LE(0);
+      for (let i = 0; i < bmp.length; i += 4)
+        if (bmp.readUInt32LE(i) !== rbg) rendererFg++;
     } catch {}
-    const ok = fg > 200;
+    const ok = fg > 200 && framesPresented > 0 && rendererFg > 200;
     const out = {
       ok,
       foregroundPixels: fg,
+      rendererForegroundPixels: rendererFg,
+      framesPresented,
       elapsedMs: Date.now() - t0,
       size: await term.sizeAsync(),
+      engine: term.engine,
       electronVersion: process.versions.electron,
       platform: process.platform,
     };

@@ -92,7 +92,10 @@ class LocalEngine {
   }
 
   _tick() {
-    if (this._term._sending) return;
+    // Always tick ghostty (drain its mailbox) — only frame PRESENTATION
+    // waits for the in-flight send. Gating the whole tick on _sending
+    // would starve the engine exactly when the presenter is busy, and
+    // diverges from the utility host, which ticks unconditionally.
     this._addon.tick(this._handle);
     if (this._addon.processExited(this._handle)) {
       if (!this._exited) {
@@ -102,6 +105,7 @@ class LocalEngine {
       }
       return;
     }
+    if (this._term._sending) return; // present later; don't advance dedup
     const frame = this._addon.frame(this._handle);
     if (!frame) return;
     // The swap chain rotates surfaces, so a new frame = a new pointer.

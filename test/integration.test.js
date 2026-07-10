@@ -80,7 +80,10 @@ test('ghostty headless-embedding demo renders marker (smoke, utility-process eng
   runElectron(['demo-ghostty-renderer/main.js', '--smoke'], 210_000);
   const r = readResult('demo-smoke.json');
   assert.ok(r.ok, 'marker rendered');
-  assert.ok(r.foregroundPixels > 200, 'text pixels present');
+  assert.ok(r.foregroundPixels > 200, 'text pixels present in the IOSurface');
+  assert.ok(r.framesPresented > 0, 'frames were imported+sent via sharedTexture');
+  assert.ok(r.rendererForegroundPixels > 200,
+    'the renderer canvas actually painted (frame→ack→sharedTexture→canvas path)');
   assert.ok(r.size.cols > 0 && r.size.rows > 0, 'grid derived from cell metrics');
   assert.ok(fs.existsSync(path.join(ROOT, 'results', 'demo-ghostty.png')), 'screenshot');
 });
@@ -90,4 +93,13 @@ test('ghostty headless-embedding demo renders marker (smoke, main-process engine
   const r = readResult('demo-smoke.json');
   assert.ok(r.ok, 'marker rendered');
   assert.ok(r.foregroundPixels > 200, 'text pixels present');
+});
+
+test('utility engine protocol behaviors (frames, input, resize, crash)', MAC, () => {
+  runElectron(['test/utility-engine.main.js'], 200_000);
+  const r = readResult('utility-engine-tests.json');
+  for (const [name, res] of Object.entries(r)) {
+    assert.ok(res.ok, `${name}: ${res.error ?? 'ok'}`);
+  }
+  assert.ok(Object.keys(r).length >= 7, 'all scenarios ran');
 });
