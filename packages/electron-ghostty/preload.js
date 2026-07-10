@@ -3,23 +3,42 @@
  * electron-ghostty renderer side, sandbox-compatible. Use directly as
  * a BrowserWindow preload, or require it from your own preload.
  *
- * Finds the page's `<canvas data-ghostty>` (fallback: first <canvas>),
- * paints ghostty-rendered shared textures into it, reports its CSS size
- * (initial + ResizeObserver) so ghostty can reflow, and forwards raw
- * input events to the main process, where ghostty's own encoders
- * (kitty keyboard protocol, mouse tracking modes, scrollback routing)
- * handle them.
+ * Supports MULTIPLE terminals per page: every `<canvas data-ghostty>`
+ * is a terminal slot, identified by the attribute's value (empty
+ * string is a valid slot name — the default for a single terminal).
+ * The main process attaches a GhosttyTerminal to a slot with
+ * `term.attach(webContents, { slot })`; frames arrive tagged with the
+ * slot and are painted into that slot's canvas.
+ *
+ * Input routing: mouse events carry the slot of the canvas they hit;
+ * keyboard/paste go to the slot of the focused canvas (canvases get
+ * tabindex focus), falling back to the single slot when there is only
+ * one. CSS size changes are reported per canvas (ResizeObserver) so
+ * ghostty reflows the grid + resizes the PTY (SIGWINCH).
  */
 const { sharedTexture, ipcRenderer } = require('electron');
 
 const CH = (name) => `electron-ghostty:${name}`;
 
-let canvas = null;
+const canvases = new Map(); // slot -> canvas
 
-sharedTexture.setSharedTextureReceiver(async (data) => {
+function slotOf(canvas) {
+  return canvas.getAttribute('data-ghostty') ?? '';
+}
+
+/** The slot input should go to: the focused canvas, else the only one. */
+function focusedSlot() {
+  const active = document.activeElement;
+  if (active && canvases.get(slotOf(active)) === active) return slotOf(active);
+  if (canvases.size === 1) return canvases.keys().next().value;
+  return null;
+}
+
+sharedTexture.setSharedTextureReceiver(async (data, slot) => {
   const { importedSharedTexture: imported } = data;
   try {
     const frame = imported.getVideoFrame();
+    const canvas = canvases.get(slot ?? '');
     if (canvas) {
       if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
         canvas.width = frame.displayWidth;
@@ -57,79 +76,101 @@ function domMods(e) {
          (e.metaKey ? 8 : 0);
 }
 
+function send(name, slot, payload) {
+  ipcRenderer.send(CH(name), { slot, ...payload });
+}
+
 window.addEventListener('DOMContentLoaded', () => {
-  canvas = document.querySelector('canvas[data-ghostty]') ||
-           document.querySelector('canvas');
-  if (!canvas) return;
-  canvas.focus();
+  for (const canvas of document.querySelectorAll('canvas[data-ghostty]'))
+    canvases.set(slotOf(canvas), canvas);
+  // Back-compat: a bare first <canvas> with no data-ghostty attribute.
+  if (canvases.size === 0) {
+    const canvas = document.querySelector('canvas');
+    if (canvas) canvases.set('', canvas);
+  }
+  if (canvases.size === 0) return;
+  canvases.values().next().value.focus();
 
   window.addEventListener('keydown', (e) => {
     if (e.metaKey) return; // Cmd shortcuts stay with the app
+    const slot = focusedSlot();
+    if (slot === null) return;
     const keycode = MAC_KEYCODE[e.code];
     if (keycode === undefined && e.key.length !== 1) return;
     e.preventDefault();
-    ipcRenderer.send(CH('key'), {
-      action: 1, // press
-      keycode: keycode ?? 0,
-      mods: domMods(e),
-      // Printable text: ghostty's encoder uses it for the byte stream.
-      text: e.key.length === 1 && !e.ctrlKey ? e.key : undefined,
-      unshiftedCodepoint:
-        e.key.length === 1 ? e.key.toLowerCase().codePointAt(0) : 0,
+    send('key', slot, {
+      event: {
+        action: 1, // press
+        keycode: keycode ?? 0,
+        mods: domMods(e),
+        // Printable text: ghostty's encoder uses it for the byte stream.
+        text: e.key.length === 1 && !e.ctrlKey ? e.key : undefined,
+        unshiftedCodepoint:
+          e.key.length === 1 ? e.key.toLowerCase().codePointAt(0) : 0,
+      },
     });
   });
 
   window.addEventListener('keyup', (e) => {
+    const slot = focusedSlot();
+    if (slot === null) return;
     const keycode = MAC_KEYCODE[e.code];
     if (keycode === undefined) return;
-    ipcRenderer.send(CH('key'), { action: 0, keycode, mods: domMods(e) });
+    send('key', slot, { event: { action: 0, keycode, mods: domMods(e) } });
   });
 
   window.addEventListener('paste', (e) => {
+    const slot = focusedSlot();
+    if (slot === null) return;
     const text = e.clipboardData.getData('text');
-    if (text) ipcRenderer.send(CH('text'), text);
+    if (text) send('text', slot, { text });
   });
 
-  const rel = (e) => {
-    const r = canvas.getBoundingClientRect();
-    return { x: e.clientX - r.left, y: e.clientY - r.top };
-  };
+  for (const [slot, canvas] of canvases) {
+    if (!canvas.hasAttribute('tabindex')) canvas.setAttribute('tabindex', '0');
 
-  canvas.addEventListener('wheel', (e) => {
-    e.preventDefault();
-    const p = rel(e);
-    // Ghostty expects scroll deltas with up = positive.
-    ipcRenderer.send(CH('mouse-scroll'), { ...p, dx: -e.deltaX, dy: -e.deltaY });
-  }, { passive: false });
+    const rel = (e) => {
+      const r = canvas.getBoundingClientRect();
+      return { x: e.clientX - r.left, y: e.clientY - r.top };
+    };
 
-  // DOM button -> ghostty_input_mouse_button_e (1=left 2=right 3=middle)
-  const GHOSTTY_BUTTON = [1, 3, 2, 4, 5];
-  canvas.addEventListener('mousedown', (e) => {
-    ipcRenderer.send(CH('mouse-button'), {
-      action: 1, button: GHOSTTY_BUTTON[e.button] ?? 0, mods: domMods(e),
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const p = rel(e);
+      // Ghostty expects scroll deltas with up = positive.
+      send('mouse-scroll', slot, { ...p, dx: -e.deltaX, dy: -e.deltaY });
+    }, { passive: false });
+
+    // DOM button -> ghostty_input_mouse_button_e (1=left 2=right 3=middle)
+    const GHOSTTY_BUTTON = [1, 3, 2, 4, 5];
+    canvas.addEventListener('mousedown', (e) => {
+      canvas.focus();
+      send('mouse-button', slot, {
+        action: 1, button: GHOSTTY_BUTTON[e.button] ?? 0, mods: domMods(e),
+      });
     });
-  });
-  canvas.addEventListener('mouseup', (e) => {
-    ipcRenderer.send(CH('mouse-button'), {
-      action: 0, button: GHOSTTY_BUTTON[e.button] ?? 0, mods: domMods(e),
+    canvas.addEventListener('mouseup', (e) => {
+      send('mouse-button', slot, {
+        action: 0, button: GHOSTTY_BUTTON[e.button] ?? 0, mods: domMods(e),
+      });
     });
-  });
-  canvas.addEventListener('mousemove', (e) => {
-    ipcRenderer.send(CH('mouse-pos'), { ...rel(e), mods: domMods(e) });
-  });
+    canvas.addEventListener('mousemove', (e) => {
+      send('mouse-pos', slot, { ...rel(e), mods: domMods(e) });
+    });
 
-  // The canvas element drives the surface size: report CSS size changes
-  // and ghostty reflows the grid + resizes the PTY. The bitmap size is
-  // set by the receiver above from each presented frame.
-  const reportSize = () => {
-    const r = canvas.getBoundingClientRect();
-    if (r.width > 0 && r.height > 0)
-      ipcRenderer.send(CH('resize'), { cssWidth: r.width, cssHeight: r.height });
-  };
-  new ResizeObserver(reportSize).observe(canvas);
+    // The canvas element drives the surface size: report CSS size
+    // changes and ghostty reflows the grid + resizes the PTY. The
+    // bitmap size is set by the receiver above from presented frames.
+    const reportSize = () => {
+      const r = canvas.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0)
+        send('resize', slot, { cssWidth: r.width, cssHeight: r.height });
+    };
+    new ResizeObserver(reportSize).observe(canvas);
 
-  requestAnimationFrame(() => requestAnimationFrame(() => {
-    reportSize();
-    ipcRenderer.send(CH('ready'));
-  }));
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      reportSize();
+      send('ready', slot, {});
+    }));
+  }
 });

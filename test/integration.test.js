@@ -95,6 +95,15 @@ test('ghostty headless-embedding demo renders marker (smoke, main-process engine
   assert.ok(r.foregroundPixels > 200, 'text pixels present');
 });
 
+test('two terminals in one page via slots (split panes)', MAC, () => {
+  runElectron(['test/multi-terminal.main.js'], 100_000);
+  const r = readResult('multi-terminal.json');
+  assert.ok(r.ok, `both panes painted: ${JSON.stringify(r)}`);
+  assert.ok(r.leftFrames > 0 && r.rightFrames > 0, 'both terminals presented frames');
+  assert.ok(r.leftRendererPx > 200 && r.rightRendererPx > 200,
+    'both halves of the composited window have content');
+});
+
 test('utility engine protocol behaviors (frames, input, resize, crash)', MAC, () => {
   runElectron(['test/utility-engine.main.js'], 200_000);
   const r = readResult('utility-engine-tests.json');

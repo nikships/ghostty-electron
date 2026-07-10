@@ -23,9 +23,8 @@
  * count, so it can't be recycled mid-transfer.
  *
  * Protocol (parentPort messages, all {type, ...}):
- *   in : create {opts} | frame-ack | key/text/mouse-* {..} |
- *        resize {widthPx,heightPx} | draw | read-pixels {id} |
- *        size {id} | destroy
+ *   in : create {opts} | frame-ack | op {method, args} (see
+ *        protocol.js) | read-pixels {id} | size {id} | destroy
  *   out: created | frame {seq,width,height,scale} | exit |
  *        reply {id, result} | error {message}
  *
@@ -33,6 +32,7 @@
  * (set by the parent before fork).
  */
 const { load } = require('./addon');
+const { checkOp } = require('./protocol');
 
 const PRESENT_INTERVAL_MS = 8; // ~120Hz poll of ghostty's swap chain
 
@@ -100,21 +100,13 @@ const handlers = {
   'frame-ack'() {
     awaitingAck = false;
   },
-  key({ event }) { addon.key(session, event); },
-  text({ text }) { addon.text(session, text); },
-  'mouse-button'({ action, button, mods }) {
-    addon.mouseButton(session, action, button, mods);
+  // All fire-and-forget session calls arrive as one message shape and
+  // dispatch through the shared op table (protocol.js) — a new op is
+  // defined once, not hand-synced between driver and host.
+  op({ method, args }) {
+    checkOp(method, args);
+    addon[method](session, ...args);
   },
-  'mouse-pos'({ x, y, mods }) { addon.mousePos(session, x, y, mods); },
-  'mouse-scroll'({ x, y, dx, dy }) {
-    addon.mouseScroll(session, x, y, dx, dy);
-  },
-  resize({ widthPx, heightPx }) {
-    // The swap chain is rebuilt on resize: the previous frame's surface
-    // ID is stale the moment this returns.
-    addon.resize(session, widthPx, heightPx);
-  },
-  draw() { addon.draw(session); },
   'read-pixels'({ id }) {
     addon.tick(session);
     addon.draw(session);
