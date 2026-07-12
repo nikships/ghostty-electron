@@ -2,6 +2,7 @@
   "name": "electron-ghostty",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Ghostty embedded headlessly in Electron: ghostty owns the PTY, VT parsing, input encoding, fonts and Metal rendering; frames reach a sandboxed <canvas> zero-copy via Electron's sharedTexture module.",
   "main": "index.js",
   "exports": {

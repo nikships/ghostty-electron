@@ -31,6 +31,7 @@
  */
 const { EventEmitter } = require('events');
 const path = require('path');
+const crypto = require('crypto');
 const { clipboard, ipcMain, sharedTexture, utilityProcess } = require('electron');
 const { load, available } = require('./addon');
 const { checkOp } = require('./protocol');
@@ -178,8 +179,16 @@ class UtilityEngine {
     this._lastSize = null;
     this._replies = new Map(); // id -> resolve
     this._replySeq = 0;
+    // Bootstrap rendezvous name. It lives in the shared per-user
+    // bootstrap namespace, so a same-user process that KNEW the name
+    // could look up the send right and squat/intercept frames. The
+    // name is therefore randomized (not the old guessable pid+counter)
+    // — but note the real trust boundary here is same-user: a process
+    // running as you can already screenshot or ptrace this app. The
+    // mach *port* is an unguessable capability; the name is not
+    // relied on as a secret. See SECURITY.md / README threat model.
     const channelName =
-      `electron-ghostty.${process.pid}.${++machChannelSeq}`;
+      `electron-ghostty.${crypto.randomBytes(16).toString('hex')}.${++machChannelSeq}`;
     this._machChannel = this._addon.machChannelCreate(channelName);
     this._child = utilityProcess.fork(
       path.join(__dirname, 'host.js'),
@@ -372,8 +381,10 @@ class GhosttyTerminal extends EventEmitter {
       throw new Error(`electron-ghostty: slot '${slot}' already attached`);
     bySlot.set(key, this);
     webContents.once('destroyed', () => {
-      if (bySlot.get(key) === this) bySlot.delete(key);
-      this._engine.stop();
+      // Full teardown, not just stop(): the utility engine's stop() is
+      // a no-op, so stopping here would leak the engine process + its
+      // shell every time a window closes. destroy() kills the child.
+      this.destroy();
     });
     return this;
   }
@@ -520,7 +531,9 @@ class GhosttyTerminal extends EventEmitter {
     if (this._destroyed) return;
     this._destroyed = true;
     clearTimeout(this._resizeTimer);
-    if (this._target && !this._target.isDestroyed()) {
+    // Always drop the slot-routing entry, even when the webContents is
+    // already gone (the 'destroyed' path) — otherwise the map leaks.
+    if (this._target) {
       const key = slotKey(this._target.id, this._slot);
       if (bySlot.get(key) === this) bySlot.delete(key);
     }

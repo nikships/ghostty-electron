@@ -73,18 +73,30 @@ jobs:
         if: runner.os == 'macOS'
         run: npm run test:integration
 
-      - name: DOM terminal flood benchmarks
+      # All benchmark steps below are SMOKES, not measurements: CI
+      # runners are noisy, and a real 3-run flood under a wall-clock
+      # watchdog flaked contributors red (3 prior timing fixes in git
+      # history). We only assert "the harness runs end to end"; real
+      # numbers are produced attended (see README).
+      - name: DOM terminal flood benchmark (smoke, 1 run)
         if: runner.os == 'macOS'
-        run: node bench/run.js flood --runs 3
+        run: node bench/run.js flood --runs 1
 
-      # 1-run smoke of the engine-placement benchmark: keeps the bench
-      # and its chart pipeline from silently rotting. Not a measurement
-      # (CI runners are noisy) — just "both engines complete a run".
       - name: Engine-placement benchmark (smoke, 1 run each)
         if: runner.os == 'macOS'
         run: |
           node bench/engine-placement.js --runs 1 --repeat 10
           node scripts/engine-placement-chart.js
+
+      # PTY race is a headline result (issue #10 sweep) but never ran in
+      # CI, so node-pty's Electron ABI + the harness could silently rot.
+      # Rebuild node-pty for Electron and run a tiny smoke of both a DOM
+      # and the native backend.
+      - name: PTY race (smoke; node-pty rebuilt for Electron)
+        if: runner.os == 'macOS'
+        run: |
+          npx @electron/rebuild -f -w node-pty
+          node bench/run.js pty --mb 2 --runs 1 --skip-web
 
       - name: DOM terminal benchmarks (Electron under xvfb)
         if: runner.os == 'Linux'

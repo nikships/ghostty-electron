@@ -2,6 +2,7 @@
   "name": "ghostty-xterm-bench",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "description": "Ghostty embedded headlessly in Electron: ghostty owns PTY, parsing, fonts, Metal rendering — frames enter the DOM zero-copy via sharedTexture. Plus DOM-terminal benchmarks (xterm.js, ghostty-web).",
   "workspaces": [
     "packages/*"

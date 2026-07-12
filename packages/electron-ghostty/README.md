@@ -129,8 +129,9 @@ tick/present loop themselves — see `src/addon.c` for that surface.
 
 ## Building
 
-The addon links a **patched** libghostty (`patches/0001` at the repo
-root): the headless apprt platform + `ghostty_surface_headless_frame()`:
+The addon links a **patched** libghostty (`patches/0002` at the repo
+root adds the headless apprt platform + `ghostty_surface_headless_frame()`;
+`patches/0001` only installs the static library + header on macOS):
 
 ```bash
 npm run setup:ghostty   # repo root: clone ghostty, apply patch, zig build

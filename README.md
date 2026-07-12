@@ -230,9 +230,15 @@ Frames cross the engine→main process boundary as **mach send-rights**
 — Electron's `parentPort` can't carry mach rights —
 `IOSurfaceLookupFromMachPort` in the parent). That's Apple's
 recommended mechanism for passing a surface "atomically or securely to
-another task": an unguessable capability, no fork patch needed. Each
-in-flight port holds +1 on the surface's global use count, so a frame
-can't be recycled mid-transfer.
+another task": the port itself is an unguessable capability, no fork
+patch needed. Each in-flight port holds +1 on the surface's global use
+count, so a frame can't be recycled mid-transfer.
+
+The rendezvous *name* the two processes use to find each other lives
+in the shared per-user bootstrap namespace, so the real trust boundary
+is same-user (a process running as you can already screenshot or
+ptrace the app). The name is randomized rather than relied on as a
+secret; see [`SECURITY.md`](SECURITY.md) for the threat model.
 
 The N-API addon (`packages/electron-ghostty/src/addon.c`, ~1k lines)
 is marshalling around `ghostty.h` plus that mach channel — ghostty
