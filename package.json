@@ -12,6 +12,7 @@
     "build:native": "cd packages/electron-ghostty && node-gyp rebuild",
     "bench": "node bench/run.js flood",
     "demo": "electron demo-ghostty-renderer/main.js",
+    "demo:gif": "electron demo-ghostty-renderer/main.js --record-gif",
     "test": "node --test test/embedded.test.js",
     "test:integration": "node --test test/integration.test.js",
     "bench:stock": "node scripts/bench-stock.js"

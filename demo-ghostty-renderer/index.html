@@ -6,7 +6,24 @@
   <style>
     html, body { height: 100%; }
     body { margin: 0; background: #1d1f21; display: flex; flex-direction: column; }
-    #badge { color: #6c7086; font: 11px -apple-system, sans-serif; padding: 4px; text-align: center; }
+    #badge {
+      height: 30px;
+      display: grid;
+      grid-template-columns: 96px 1fr 96px;
+      align-items: center;
+      background: #202126;
+      border-bottom: 1px solid #30323a;
+      color: #b8bdca;
+      font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      user-select: none;
+      -webkit-app-region: drag;
+    }
+    #traffic { display: flex; gap: 8px; padding-left: 13px; }
+    #traffic span { width: 12px; height: 12px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.22); }
+    #traffic .close { background: #ff5f57; }
+    #traffic .min { background: #ffbd2e; }
+    #traffic .zoom { background: #28c840; }
+    #title { text-align: center; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     /* The canvas element's CSS size drives ghostty's surface size
        (reported by the preload's ResizeObserver); its bitmap size is
        set per presented frame. */
@@ -14,7 +31,11 @@
   </style>
 </head>
 <body>
-  <div id="badge">ghostty embedded headlessly (approach A): ghostty owns PTY, parsing, input encoding, fonts, Metal rendering — frames imported zero-copy via sharedTexture</div>
+  <div id="badge">
+    <div id="traffic" aria-hidden="true"><span class="close"></span><span class="min"></span><span class="zoom"></span></div>
+    <div id="title">ghostty embedded in Electron</div>
+    <div></div>
+  </div>
   <canvas data-ghostty tabindex="0"></canvas>
 </body>
 </html>

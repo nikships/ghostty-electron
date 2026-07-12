@@ -31,8 +31,9 @@ macOS-only for now (Metal + IOSurface). Linux needs an EGL/GBM
 presenter (probe experiments in `native/renderer-poc/`); Windows has
 no presentation path in this architecture — the earlier CPU-rasterizer
 iteration had a working D3D11/DirectWrite producer, last at repo
-commit `1a4357c`. See `docs/ghostty-renderer-reuse.md` at the repo
-root.
+commit `1a4357c`. See
+[`docs/ghostty-renderer-reuse.md`](../../docs/ghostty-renderer-reuse.md)
+at the repo root.
 
 
 ## Usage

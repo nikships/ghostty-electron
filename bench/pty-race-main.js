@@ -22,11 +22,11 @@
  *     Sentinel detection: renderer scans the terminal buffer tail.
  *   ghostty (native): ghostty owns the PTY — no external flow control
  *     exists or is needed (backpressure is inherent). Sentinel
- *     detection: the sentinel command sets the window title (OSC 0);
- *     the clock stops at the first PRESENTED frame after the title
- *     event — parsed-and-presented, the closest honest equivalent to
- *     the DOM buffer scan. Methodological differences stated in the
- *     results.
+ *     detection: the sentinel command sets the window title (OSC 0)
+ *     and prints visible marker text; the clock stops at the first
+ *     PRESENTED frame after the title event — parsed-and-presented,
+ *     the closest honest equivalent to the DOM buffer scan.
+ *     Methodological differences are stated in the results.
  *
  * Usage:
  *   electron bench/pty-race-main.js --backend xterm|ghostty-web|ghostty
@@ -230,7 +230,11 @@ async function runNative() {
     term.key({ action: 1, keycode: 36, mods: 0 });
     term.key({ action: 0, keycode: 36, mods: 0 });
   };
-  const titleCmd = (marker) => `printf '\\033]0;${marker}\\007'`;
+  // The OSC title is the native-side parse signal; the visible marker
+  // guarantees a new dirty frame after the title event. Without visible
+  // output, a title-only sentinel can hang forever waiting for "the
+  // frame after the title" because OSC 0 does not dirty the surface.
+  const markerCmd = (marker) => `printf '\\033]0;${marker}\\007${marker}\\n'`;
 
   const ready = new Promise((resolve) => term.once('ready', resolve));
   term.attach(win.webContents);
@@ -250,13 +254,13 @@ async function runNative() {
     // ctrl) — the same renderer->encoder path a real keystroke takes.
     term.key({ action: 1, keycode: 8, mods: 2, unshiftedCodepoint: 99 });
     term.key({ action: 0, keycode: 8, mods: 2 });
-    type(titleCmd('P0NGq'));
+    type(markerCmd('P0NGq'));
     await found;
     writeResult({ interruptMs: +(now() - tIntr).toFixed(1) });
   } else {
     const found = visible('D0NEq');
     const t0 = now();
-    type(`${catLoop} && ${titleCmd('D0NEq')}`);
+    type(`${catLoop} && ${markerCmd('D0NEq')}`);
     await found;
     writeResult({
       catMs: +(now() - t0).toFixed(1),

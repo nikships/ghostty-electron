@@ -19,6 +19,7 @@
     "addon.js",
     "host.js",
     "preload.js",
+    "protocol.js",
     "binding.gyp",
     "src/"
   ]

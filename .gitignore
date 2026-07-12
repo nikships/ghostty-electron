@@ -1,5 +1,6 @@
 node_modules/
 vendor/
+.claude/
 payload.txt
 payload-*.txt
 results/

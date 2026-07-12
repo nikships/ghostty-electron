@@ -36,8 +36,9 @@ function focusedSlot() {
 
 sharedTexture.setSharedTextureReceiver(async (data, slot) => {
   const { importedSharedTexture: imported } = data;
+  let frame = null;
   try {
-    const frame = imported.getVideoFrame();
+    frame = imported.getVideoFrame();
     const canvas = canvases.get(slot ?? '');
     if (canvas) {
       if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
@@ -46,8 +47,8 @@ sharedTexture.setSharedTextureReceiver(async (data, slot) => {
       }
       canvas.getContext('2d').drawImage(frame, 0, 0);
     }
-    frame.close();
   } finally {
+    if (frame) frame.close();
     imported.release();
   }
 });

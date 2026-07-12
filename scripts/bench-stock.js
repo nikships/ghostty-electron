@@ -5,10 +5,10 @@
  *
  * We can't read a stock terminal's screen, so the only honest finish line is
  * write-side: the shell times `cat` itself (backpressure means cat can't
- * finish until the terminal has consumed the bytes). The Electron terminals
- * report the same finish line as `catExitMs` in `npm run bench:pty` results,
- * so all three are compared like-for-like. CPU/RSS of the Ghostty process is
- * sampled via ps.
+ * finish until the terminal has consumed the bytes). Current Electron PTY
+ * races use visible sentinels instead, so this is a stock-app reference
+ * rather than a like-for-like chart input. CPU/RSS of the Ghostty process
+ * is sampled via ps.
  *
  * Usage: node scripts/bench-stock.js [--mb N] [--app /Applications/Ghostty.app]
  */

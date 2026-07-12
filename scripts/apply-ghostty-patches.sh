@@ -11,6 +11,19 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd -P)"
+REQUIRED_ZIG=0.15.2
+
+if ! command -v zig >/dev/null 2>&1; then
+  echo "zig not found — install zig $REQUIRED_ZIG and put it on PATH" >&2
+  exit 1
+fi
+
+ZIG_VERSION="$(zig version)"
+if [ "$ZIG_VERSION" != "$REQUIRED_ZIG" ]; then
+  echo "zig $REQUIRED_ZIG required by the pinned ghostty checkout; found $ZIG_VERSION" >&2
+  echo "On Homebrew: PATH=\"/opt/homebrew/opt/zig@0.15/bin:\$PATH\" npm run setup:ghostty" >&2
+  exit 1
+fi
 
 if [ ! -d vendor/ghostty ]; then
   echo "vendor/ghostty missing — run npm run setup:ghostty first" >&2

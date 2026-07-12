@@ -123,7 +123,7 @@ if (SWEEP) {
   console.log('═'.repeat(70));
   console.log('  NOTE: DOM backends use VS Code\'s real flow-control constants');
   console.log('  (100K/5K/5K) by default; ghostty owns its PTY (no flow control');
-  console.log('  needed) and its sentinel is title-change + presented frame.');
+  console.log('  needed) and its sentinel is title-change + visible marker frame.');
   fs.writeFileSync(
     path.join(ROOT, 'results', 'pty-race-summary.json'),
     JSON.stringify({ mb: MB, runs: RUNS, ...summary }, null, 2));
