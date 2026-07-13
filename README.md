@@ -68,7 +68,7 @@ reasons above still stand; this is research, not a VS Code proposal.)
   (any ghostty option). `--engine=main` runs the engine in-process
   instead of the default utilityProcess.
 - `npm run demo:gif` — deterministic 30 fps demo capture with
-  titlebar-style chrome, a visible cursor, and a click interaction;
+  terminal-only content, a visible cursor, and a click interaction;
   writes `results/demo-ghostty.gif`
   if `ffmpeg` is installed. The checked-in README GIF uses content
   capture so it cannot include unrelated desktop pixels. Pass
