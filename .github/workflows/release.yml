@@ -1,0 +1,94 @@
+# Builds and publishes consumable prebuilts so downstream apps (e.g. Foundry)
+# can vendor electron-ghostty without a Zig toolchain or the ghostty source.
+#
+# The N-API addon statically links libghostty.a (see binding.gyp), so the
+# package tarball is self-contained: unpack it into node_modules/ (or a
+# vendor dir) and `require()` it — no postinstall, no native build on the
+# consumer side. N-API keeps the binary ABI-stable across Electron versions.
+#
+# Artifacts per release:
+#   electron-ghostty-<ref>-darwin-arm64.tar.gz  the package + prebuilt .node
+#   libghostty.a / ghostty.h                    the patched static lib + header,
+#                                               for embedders building their own
+#                                               binding
+#   SHA256SUMS
+#
+# Trigger with a `v*` tag for a real release, or workflow_dispatch for a
+# dry-run (artifacts uploaded to the workflow run only, no GitHub Release).
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: macOS prebuilts (electron-ghostty + libghostty)
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build patched libghostty (clone + fork patch + full lib)
+        run: npm run setup:ghostty
+
+      - name: Build N-API addon (ghostty embedding wrapper)
+        run: npm run build:native
+
+      # Fast correctness gate before shipping bits: spawn/input/resize/scroll
+      # against the freshly built addon, real IOSurface pixels, no Electron.
+      - name: E2E smoke against the built addon
+        run: npm test
+
+      - name: Stage and package artifacts
+        run: |
+          set -euo pipefail
+          REF="${GITHUB_REF_NAME}"
+          case "$REF" in v*) VERSION="$REF" ;; *) VERSION="dev-$(git rev-parse --short HEAD)" ;; esac
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          STAGE=dist/electron-ghostty
+          mkdir -p "$STAGE/build/Release" dist/out
+
+          # The package's published surface (mirrors "files" in its
+          # package.json) plus the prebuilt binary and license texts.
+          cd packages/electron-ghostty
+          cp index.js addon.js host.js preload.js protocol.js binding.gyp package.json README.md "../../$STAGE/"
+          cp -R src "../../$STAGE/src"
+          cp build/Release/ghostty_renderer.node "../../$STAGE/build/Release/"
+          cd ../..
+          cp LICENSE THIRD_PARTY_NOTICES.md "$STAGE/"
+
+          tar -czf "dist/out/electron-ghostty-$VERSION-darwin-arm64.tar.gz" -C dist electron-ghostty
+          cp vendor/ghostty/zig-out/lib/libghostty.a dist/out/
+          cp vendor/ghostty/include/ghostty.h dist/out/
+          (cd dist/out && shasum -a 256 * > SHA256SUMS)
+          ls -la dist/out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prebuilts-${{ env.VERSION }}
+          path: dist/out/
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/out/*
+          generate_release_notes: true
