@@ -271,7 +271,7 @@ benchmarks:
 
 macOS (arm64 tested) — Node 22.23.1 (pinned in `.node-version`),
 Xcode CLT,
-[zig](https://ziglang.org) matching ghostty's pin (0.15.2):
+[zig](https://ziglang.org) matching ghostty's pin (0.16.0):
 
 ```bash
 npm install

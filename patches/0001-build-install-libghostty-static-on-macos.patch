@@ -1,7 +1,7 @@
-From cb4a04c60ec26f259653a6e6f81ca268e16d2f4f Mon Sep 17 00:00:00 2001
+From 64350ec7ddc320877b277639778099e48aecaa65 Mon Sep 17 00:00:00 2001
 From: Max Schmitt <max@schmitt.mx>
 Date: Fri, 10 Jul 2026 14:20:30 -0700
-Subject: [PATCH] build: install libghostty.a + header on macOS
+Subject: [PATCH 1/2] build: install libghostty.a + header on macOS
 
 The static archive was only consumable through the xcframework path
 (the Ghostty.app Xcode project). Install it directly on macOS too so
@@ -12,10 +12,10 @@ happens on Linux/Windows.
  1 file changed, 6 insertions(+), 2 deletions(-)
 
 diff --git a/build.zig b/build.zig
-index 8ef7701..929f5fd 100644
+index acf19ac91..3298179dc 100644
 --- a/build.zig
 +++ b/build.zig
-@@ -189,8 +189,6 @@ pub fn build(b: *std.Build) !void {
+@@ -192,8 +192,6 @@ pub fn build(b: *std.Build) !void {
          const lib_shared = try buildpkg.GhosttyLib.initShared(b, &deps);
          const lib_static = try buildpkg.GhosttyLib.initStatic(b, &deps);
  
@@ -24,7 +24,7 @@ index 8ef7701..929f5fd 100644
          if (!config.target.result.os.tag.isDarwin()) {
              lib_shared.installHeader(); // Only need one header
              if (config.target.result.os.tag == .windows) {
-@@ -200,6 +198,12 @@ pub fn build(b: *std.Build) !void {
+@@ -203,6 +201,12 @@ pub fn build(b: *std.Build) !void {
                  lib_shared.install("ghostty-internal.so");
                  lib_static.install("ghostty-internal.a");
              }
@@ -38,5 +38,5 @@ index 8ef7701..929f5fd 100644
      }
  
 -- 
-2.50.1 (Apple Git-155)
+2.49.0
 

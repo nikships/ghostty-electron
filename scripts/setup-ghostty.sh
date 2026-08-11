@@ -10,7 +10,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-PIN=c41c6b81a4642ccba18d47b375d9495664de72a0
+PIN=94d775fefc21f74d9cc85a46b34c4e1d85318fd0
 
 if [ -e vendor/ghostty ] && [ ! -d vendor/ghostty/.git ]; then
   echo "vendor/ghostty exists but is not a git checkout; move it aside and rerun" >&2
