@@ -4,14 +4,14 @@
 #
 # Idempotent: skips patches whose changes are already applied.
 #
-# Requires zig matching ghostty's pin (0.15.2). The full lib is a
+# Requires zig matching ghostty's pin (0.16.0). The full lib is a
 # different artifact than libghostty-vt: it contains the entire
 # terminal + font + Metal renderer stack.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd -P)"
-REQUIRED_ZIG=0.15.2
+REQUIRED_ZIG=0.16.0
 
 if ! command -v zig >/dev/null 2>&1; then
   echo "zig not found — install zig $REQUIRED_ZIG and put it on PATH" >&2
@@ -21,7 +21,7 @@ fi
 ZIG_VERSION="$(zig version)"
 if [ "$ZIG_VERSION" != "$REQUIRED_ZIG" ]; then
   echo "zig $REQUIRED_ZIG required by the pinned ghostty checkout; found $ZIG_VERSION" >&2
-  echo "On Homebrew: PATH=\"/opt/homebrew/opt/zig@0.15/bin:\$PATH\" npm run setup:ghostty" >&2
+  echo "On Homebrew: PATH=\"/opt/homebrew/opt/zig@0.16/bin:\$PATH\" npm run setup:ghostty" >&2
   exit 1
 fi
 
